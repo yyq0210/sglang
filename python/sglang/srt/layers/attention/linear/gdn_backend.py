@@ -285,6 +285,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
+        # Cached layer weights for KV buffer replay. Populated lazily on the
+        # first target_verify forward pass when KV buffer mode is active.
+        # Maps mamba-internal layer index → (A_log, dt_bias).
+        self._kv_replay_layer_weights: dict = {}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -400,11 +404,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
+            intermediate_kv_cache = mamba_cache_params.intermediate_kv
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
             intermediate_state_indices = self.verify_intermediate_state_indices
+            use_kv_buffer = intermediate_kv_cache is not None
         else:
+            use_kv_buffer = False
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
         if is_target_verify:
@@ -427,6 +434,48 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+
+            # KV buffer mode: store post-conv1d mixed_qkv + gating inputs (a, b)
+            # per draft step so we can replay the recurrent update later with
+            # only the accepted steps.
+            if use_kv_buffer:
+                qkv_dim = mixed_qkv.shape[-1]
+                # Store a and b as flat per-token vectors for replay.
+                # For GDN, a is [T, HV] and b is [1, T, HV]; we use
+                # stride()[-2] to get the token-axis stride generically
+                # (works for both 2D [T, X] and 3D [B, T, X] layouts).
+                _stride_a = a.stride()[-2]
+                a_flat = a.flatten()[: seq_len * _stride_a].view(
+                    seq_len, _stride_a
+                )
+                b_flat = b.reshape(seq_len, -1)
+                kv_data = torch.cat(
+                    [mixed_qkv, a_flat, b_flat], dim=-1
+                )
+                saved_dim = kv_data.shape[-1]
+                # kv_data: [seq_len, saved_dim] → [batch_size, draft_token_num, saved_dim]
+                kv_data = kv_data.view(batch_size, draft_token_num, saved_dim)
+                buf_indices = intermediate_state_indices[:batch_size]
+                intermediate_kv_cache[
+                    buf_indices, :draft_token_num, :saved_dim
+                ] = kv_data.to(intermediate_kv_cache.dtype)
+                # Cache layer weights for the replay in
+                # update_mamba_state_after_mtp_verify.
+                mamba_idx = self.req_to_token_pool.mamba_map[layer.layer_id]
+                if mamba_idx not in self._kv_replay_layer_weights:
+                    self._kv_replay_layer_weights[mamba_idx] = (
+                        layer.A_log,
+                        layer.dt_bias,
+                        layer.num_q_heads,
+                        layer.num_k_heads,
+                        layer.num_v_heads,
+                        layer.head_q_dim,
+                        layer.head_k_dim,
+                        layer.head_v_dim,
+                        _stride_a,          # a_dim per token (HV for GDN)
+                        b_flat.shape[-1],   # b_dim per token (HV)
+                        False,              # is_kda
+                    )
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:
@@ -483,7 +532,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
-                intermediate_states_buffer=intermediate_state_cache,
+                # KV buffer mode: skip caching full intermediate SSM states;
+                # the lightweight KV buffer was already populated above.
+                intermediate_states_buffer=(
+                    None if use_kv_buffer else intermediate_state_cache
+                ),
                 intermediate_state_indices=intermediate_state_indices,
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,

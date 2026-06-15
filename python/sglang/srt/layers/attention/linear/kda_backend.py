@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     get_linear_attn_decode_backend,
@@ -66,13 +67,17 @@ class KDAKernelDispatcher:
                 "KDA currently only supports 'triton'."
             )
 
+        # Verify kernel: always triton for KDA (no FlashInfer variant).
+        self.verify_kernel = triton_kernel
+
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
         )
 
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
-            f"extend={self.extend_kernel.__class__.__name__} "
+            f"extend={self.extend_kernel.__class__.__name__}, "
+            f"verify={self.verify_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
 
@@ -163,6 +168,35 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
+    def target_verify(
+        self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.verify_kernel.target_verify(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            **kwargs,
+        )
+
 
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
@@ -172,6 +206,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
+        self.verify_intermediate_state_indices = torch.arange(
+            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
+        )
+        self._kv_replay_layer_weights: dict = {}
 
     def forward_decode(
         self,
@@ -251,77 +289,193 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
-        query_start_loc = self.forward_metadata.query_start_loc
-        cache_indices = self.forward_metadata.mamba_cache_indices
+        seq_len = mixed_qkv.shape[0]
+
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
+        forward_metadata = self.forward_metadata
+
+        query_start_loc = forward_metadata.query_start_loc
+        cache_indices = forward_metadata.mamba_cache_indices
+        retrieve_next_token = forward_metadata.retrieve_next_token
+        retrieve_next_sibling = forward_metadata.retrieve_next_sibling
+        retrieve_parent_token = forward_metadata.retrieve_parent_token
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
-
+        # KDA conv state is (conv_k-1, dim) — transpose to (dim, conv_k-1)
+        # for causal_conv1d APIs that expect (dim, conv_k-1).
+        conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
 
-        has_initial_state = forward_batch.extend_prefix_lens > 0
-
-        splits = [layer.q_dim, layer.k_dim, layer.v_dim]
-        q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
-        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
-            splits, dim=0
-        )
-        q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
-        if layer.bias is not None:
-            q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+        if is_target_verify:
+            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+            intermediate_state_cache = mamba_cache_params.intermediate_ssm
+            intermediate_kv_cache = mamba_cache_params.intermediate_kv
+            # KDA stores conv states as (conv_k-1, dim) but causal_conv1d_update
+            # expects (dim, conv_k-1). The intermediate conv window cache is
+            # allocated with the same layout as conv_states for scatter compat,
+            # so transpose its last two dims here for the API.
+            intermediate_conv_window_cache = (
+                mamba_cache_params.intermediate_conv_window[0].transpose(-1, -2)
+            )
+            intermediate_state_indices = self.verify_intermediate_state_indices
+            use_kv_buffer = intermediate_kv_cache is not None
         else:
-            q_bias, k_bias, v_bias = None, None, None
+            use_kv_buffer = False
+            has_initial_state = forward_batch.extend_prefix_lens > 0
 
-        q = causal_conv1d_fn(
-            q,
-            q_conv_weight,
-            q_bias,
-            activation="silu",
-            conv_states=q_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        k = causal_conv1d_fn(
-            k,
-            k_conv_weight,
-            k_bias,
-            activation="silu",
-            conv_states=k_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        v = causal_conv1d_fn(
-            v,
-            v_conv_weight,
-            v_bias,
-            activation="silu",
-            conv_states=v_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+        if is_target_verify:
+            batch_size = seq_len // forward_batch.spec_info.draft_token_num
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            mixed_qkv_reshaped = mixed_qkv.view(
+                batch_size, draft_token_num, -1
+            ).transpose(1, 2)
+            # KDA conv state is transposed (conv_k-1, dim) — transpose to
+            # (dim, conv_k-1) for causal_conv1d_update.
+            mixed_qkv_processed = causal_conv1d_update(
+                mixed_qkv_reshaped,
+                conv_states.transpose(-1, -2),
+                layer.conv_weights,
+                layer.bias,
+                activation="silu",
+                conv_state_indices=cache_indices[:batch_size],
+                intermediate_conv_window=intermediate_conv_window_cache,
+                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                retrieve_parent_token=retrieve_parent_token,
+            )
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
 
-        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
-        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
-        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+            # KV buffer mode: store post-conv1d mixed_qkv + gating inputs (a, b)
+            if use_kv_buffer:
+                qkv_dim = mixed_qkv.shape[-1]
+                # KDA a is [1, T, HV, K] → reshape to [T, HV*K] for storage.
+                # This matches the decode-mode stride (HV*K per token).
+                a_flat = a.reshape(seq_len, -1)  # [T, HV*K]
+                b_flat = b.reshape(seq_len, -1)  # [T, HV]
+                kv_data = torch.cat(
+                    [mixed_qkv, a_flat, b_flat], dim=-1
+                )
+                saved_dim = kv_data.shape[-1]
+                kv_data = kv_data.view(batch_size, draft_token_num, saved_dim)
+                buf_indices = intermediate_state_indices[:batch_size]
+                intermediate_kv_cache[
+                    buf_indices, :draft_token_num, :saved_dim
+                ] = kv_data.to(intermediate_kv_cache.dtype)
+                # Cache layer weights for the replay in
+                # update_mamba_state_after_mtp_verify.
+                mamba_idx = self.req_to_token_pool.mamba_map[layer.layer_id]
+                if mamba_idx not in self._kv_replay_layer_weights:
+                    self._kv_replay_layer_weights[mamba_idx] = (
+                        layer.A_log,
+                        layer.dt_bias,
+                        layer.num_q_heads,
+                        layer.num_k_heads,
+                        layer.num_v_heads,
+                        layer.head_q_dim,
+                        layer.head_k_dim,
+                        layer.head_v_dim,
+                        a_flat.shape[-1],   # a_dim per token (HV*K for KDA)
+                        b_flat.shape[-1],   # b_dim per token (HV)
+                        True,               # is_kda
+                    )
 
-        core_attn_out = self.kernel_dispatcher.extend(
-            q=q,
-            k=k,
-            v=v,
-            g=a,
-            beta=b,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            lower_bound=getattr(layer, "lower_bound", None),
-        )
+            # Split into q/k/v and reshape to 4D [1, T, H, D].
+            q, k, v = mixed_qkv.split(
+                [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+            )
+            q = q.view(1, seq_len, layer.num_q_heads, layer.head_q_dim)
+            k = k.view(1, seq_len, layer.num_k_heads, layer.head_k_dim)
+            v = v.view(1, seq_len, layer.num_v_heads, layer.head_v_dim)
+
+            # KDA a is [1, T, HV, K] from model — reshape to [1, T, HV*K]
+            # so stride[-2] = HV*K (the correct token stride for is_kda=True).
+            a = a.reshape(1, seq_len, -1)
+
+            core_attn_out = self.kernel_dispatcher.target_verify(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                intermediate_states_buffer=(
+                    None if use_kv_buffer else intermediate_state_cache
+                ),
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=forward_batch.spec_info.draft_token_num,
+                retrieve_parent_token=retrieve_parent_token,
+            )
+        else:
+            conv_states_t = conv_states.transpose(-1, -2)
+
+            splits = [layer.q_dim, layer.k_dim, layer.v_dim]
+            q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
+            q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+                splits, dim=0
+            )
+            q_conv_state, k_conv_state, v_conv_state = conv_states_t.split(
+                splits, dim=-2
+            )
+            if layer.bias is not None:
+                q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+            else:
+                q_bias, k_bias, v_bias = None, None, None
+
+            q = causal_conv1d_fn(
+                q,
+                q_conv_weight,
+                q_bias,
+                activation="silu",
+                conv_states=q_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            k = causal_conv1d_fn(
+                k,
+                k_conv_weight,
+                k_bias,
+                activation="silu",
+                conv_states=k_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            v = causal_conv1d_fn(
+                v,
+                v_conv_weight,
+                v_bias,
+                activation="silu",
+                conv_states=v_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+
+            q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+            k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+            v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+
+            core_attn_out = self.kernel_dispatcher.extend(
+                q=q,
+                k=k,
+                v=v,
+                g=a,
+                beta=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                lower_bound=getattr(layer, "lower_bound", None),
+            )
 
         return core_attn_out

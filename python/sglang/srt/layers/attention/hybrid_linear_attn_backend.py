@@ -12,6 +12,9 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
 )
+from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
 )
@@ -995,16 +998,40 @@ class HybridLinearAttnBackend(AttentionBackend):
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
+        intermediate_kv_cache = mamba_caches.intermediate_kv
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        # Use fully fused kernel that handles masking internally
-        # This avoids separate nonzero() and index_select() calls
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
+        use_kv_buffer = intermediate_kv_cache is not None
+
+        if use_kv_buffer:
+            # The KV buffer was stored at sequential positions 0..N-1 via
+            # verify_intermediate_state_indices[:batch_size] (torch.arange).
+            # state_indices_tensor holds the actual cache-slot IDs for the
+            # SSM state pool.  We pass both so the replay reads from the
+            # right buffer slot and writes to the right pool slot.
+            kv_buffer_indices = torch.arange(
+                request_number,
+                dtype=torch.int32,
+                device=state_indices_tensor.device,
+            )
+            self._kv_buffer_replay_ssm_states(
+                ssm_states=ssm_states,
+                intermediate_kv_cache=intermediate_kv_cache,
+                kv_buffer_indices=kv_buffer_indices,
+                state_indices_tensor=state_indices_tensor,
+                last_correct_step_indices=last_correct_step_indices,
+                kv_buffer_qkv_dim=mamba_caches.kv_buffer_qkv_dim,
+            )
+        else:
+            # Legacy path: scatter cached intermediate SSM states.
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
+
+        # Conv window scatter — same for both paths.
         fused_mamba_state_scatter_with_mask(
             conv_states,
             intermediate_conv_window_cache,
@@ -1015,16 +1042,159 @@ class HybridLinearAttnBackend(AttentionBackend):
         # Track indices used for tracking mamba states for prefix cache
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
-            # Use fully fused kernel for track scatter operations
-            fused_mamba_state_scatter_with_mask(
-                ssm_states,
-                intermediate_state_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )
+            if use_kv_buffer:
+                # Track indices share the same sequential KV buffer
+                # positions as the main call (same batch, same storage
+                # order).  mamba_track_indices are the *destination*
+                # cache-slot IDs in the SSM state pool.
+                self._kv_buffer_replay_ssm_states(
+                    ssm_states=ssm_states,
+                    intermediate_kv_cache=intermediate_kv_cache,
+                    kv_buffer_indices=kv_buffer_indices,
+                    state_indices_tensor=mamba_track_indices,
+                    last_correct_step_indices=mamba_steps_to_track,
+                    kv_buffer_qkv_dim=mamba_caches.kv_buffer_qkv_dim,
+                )
+            else:
+                fused_mamba_state_scatter_with_mask(
+                    ssm_states,
+                    intermediate_state_cache,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
             fused_mamba_state_scatter_with_mask(
                 conv_states,
                 intermediate_conv_window_cache,
                 mamba_track_indices,
                 mamba_steps_to_track,
+            )
+
+    def _kv_buffer_replay_ssm_states(
+        self,
+        ssm_states: torch.Tensor,
+        intermediate_kv_cache: torch.Tensor,
+        kv_buffer_indices: torch.Tensor,
+        state_indices_tensor: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
+        kv_buffer_qkv_dim: int,
+    ):
+        """Replay accepted KV steps through the recurrent update to produce
+        the correct final SSM state, then write it back to the state pool.
+
+        This replaces the ``fused_mamba_state_scatter_with_mask`` call for SSM
+        states when KV buffer mode is active.
+
+        Args:
+            ssm_states: per-layer SSM state pool [num_layers, pool_size, HV, K, V]
+            intermediate_kv_cache: per-layer KV buffer
+                [num_layers, spec_size+1, draft_tokens, saved_dim]
+            kv_buffer_indices: sequential indices (0..N-1) used to read from
+                the KV buffer — must match the indices used during storage.
+            state_indices_tensor: cache-slot indices into ssm_states — used
+                to read the initial state and write back the updated state.
+            last_correct_step_indices: per-request last accepted step index.
+            kv_buffer_qkv_dim: number of elements in the mixed_qkv portion
+                of the packed KV buffer.
+        """
+        backend = self.linear_attn_backend
+        layer_weights = backend._kv_replay_layer_weights
+        num_layers = ssm_states.shape[0]
+        request_number = kv_buffer_indices.shape[0]
+
+        # accept_lens[i] = last_correct_step_indices[i] + 1 (number of steps
+        # to replay, inclusive of the accepted step).
+        accept_lens = last_correct_step_indices + 1  # [request_number]
+        max_accept_len = int(accept_lens.max().item())
+
+        if max_accept_len == 0:
+            return
+
+        # Build cu_seqlens for varlen kernel call.
+        cu_seqlens = torch.zeros(
+            request_number + 1,
+            dtype=torch.int32,
+            device=state_indices_tensor.device,
+        )
+        torch.cumsum(accept_lens.to(torch.int32), dim=0, out=cu_seqlens[1:])
+        total_tokens = int(cu_seqlens[-1].item())
+
+        if total_tokens == 0:
+            return
+
+        # Precompute the accept mask once for all layers.
+        step_range = torch.arange(
+            max_accept_len, device=accept_lens.device
+        ).unsqueeze(0)  # [1, max_accept_len]
+        accept_mask = step_range < accept_lens.unsqueeze(1)  # [R, max_accept_len]
+
+        for layer_idx in range(num_layers):
+            if layer_idx not in layer_weights:
+                continue  # no cached weights (shouldn't happen)
+
+            layer_w = layer_weights[layer_idx]
+            (
+                A_log,
+                dt_bias,
+                num_q_heads,
+                num_k_heads,
+                num_v_heads,
+                head_q_dim,
+                head_k_dim,
+                head_v_dim,
+                a_dim,
+                b_dim,
+            ) = layer_w[:10]
+            is_kda = layer_w[10] if len(layer_w) > 10 else False
+
+            # Gather accepted steps from the KV buffer for this layer.
+            # intermediate_kv_cache[layer_idx]: [spec_size+1, draft_tokens, saved_dim]
+            layer_kv = intermediate_kv_cache[layer_idx]
+
+            # Use kv_buffer_indices (sequential 0..N-1) to read from the KV
+            # buffer — these match the indices used during forward_extend
+            # storage (verify_intermediate_state_indices[:batch_size]).
+            kv_buf_dim = layer_kv.shape[-1]
+            gathered = layer_kv[kv_buffer_indices, :max_accept_len]
+            # gathered: [request_number, max_accept_len, kv_buf_dim]
+
+            # Mask out steps beyond each request's accept length and pack.
+            packed = gathered[accept_mask]  # [total_tokens, kv_buf_dim]
+
+            # Split into mixed_qkv, a, b.
+            mixed_qkv = packed[:, :kv_buffer_qkv_dim].contiguous()
+            a_data = packed[:, kv_buffer_qkv_dim : kv_buffer_qkv_dim + a_dim]
+            b_data = packed[:, kv_buffer_qkv_dim + a_dim : kv_buffer_qkv_dim + a_dim + b_dim]
+
+            q_dim = num_q_heads * head_q_dim
+            k_dim = num_k_heads * head_k_dim
+            v_dim = num_v_heads * head_v_dim
+            q, k, v = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
+            q = q.view(1, total_tokens, num_q_heads, head_q_dim)
+            k = k.view(1, total_tokens, num_k_heads, head_k_dim)
+            v = v.view(1, total_tokens, num_v_heads, head_v_dim)
+
+            # Reshape a and b to 3D [1, total_tokens, dim] so the kernel
+            # wrapper's ``stride_a = a.stride()[-2]`` picks up the correct
+            # token-axis stride (a_dim for a, b_dim for b).
+            a_replay = a_data.contiguous().unsqueeze(0)  # [1, total_tokens, a_dim]
+            b_replay = b_data.contiguous().unsqueeze(0)  # [1, total_tokens, b_dim]
+
+            # Run the recurrent update with state write-back enabled.
+            # state_indices_tensor indexes into ssm_states (the main pool).
+            fused_sigmoid_gating_delta_rule_update(
+                A_log=A_log,
+                a=a_replay,
+                dt_bias=dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q,
+                k=k,
+                v=v,
+                b=b_replay,
+                initial_state_source=ssm_states[layer_idx],
+                initial_state_indices=state_indices_tensor,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=True,
+                is_kda=is_kda,
+                disable_state_update=False,
             )

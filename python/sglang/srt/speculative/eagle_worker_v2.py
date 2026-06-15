@@ -1274,11 +1274,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
-        # Update mamba state for hybrid GDN models after verification
+        # Update mamba state for hybrid models after verification
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
             or self.target_worker.model_runner.mamba2_config is not None
             or self.target_worker.model_runner.hybrid_lightning_config is not None
+            or self.target_worker.model_runner.kimi_linear_config is not None
         ):
             self._mamba_verify_update(batch, accept_lens, accept_index, bs)
 

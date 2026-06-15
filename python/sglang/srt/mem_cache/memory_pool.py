@@ -33,7 +33,10 @@ import numpy as np
 import torch
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+from sglang.srt.configs.mamba_utils import (
+    BaseLinearStateParams,
+    KimiLinearCacheParams,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import index_buf_accessor
@@ -225,23 +228,40 @@ class MambaPool:
             for f in fields(self):
                 name = f.name
                 v = getattr(self, name)
-                if name in ("conv", "intermediate_conv_window"):
+                if v is None:
+                    kwargs[name] = None
+                elif name in ("conv", "intermediate_conv_window"):
                     kwargs[name] = [conv[layer] for conv in v]
+                elif isinstance(v, (int, float)):
+                    # Scalar metadata fields (e.g. kv_buffer_qkv_dim) are
+                    # shared across all layers — pass through unchanged.
+                    kwargs[name] = v
                 else:
                     kwargs[name] = v[layer]
 
             return type(self)(**kwargs)
 
         def mem_usage_bytes(self):
-            return sum(
-                get_tensor_size_bytes(getattr(self, f.name))
-                for f in dataclasses.fields(self)
-            )
+            total = 0
+            for f in dataclasses.fields(self):
+                v = getattr(self, f.name)
+                if v is not None and isinstance(
+                    v, (torch.Tensor, list)
+                ):
+                    total += get_tensor_size_bytes(v)
+            return total
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        intermediate_ssm: torch.Tensor
+        intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
+        # KV buffer mode: stores lightweight per-token KV vectors (mixed_qkv,
+        # a, b) instead of full O(d^2) SSM states during target verification.
+        # None when using the legacy intermediate_ssm path.
+        intermediate_kv: Optional[torch.Tensor] = None
+        # QKV dim for splitting KV buffer back into mixed_qkv / a / b during
+        # replay.  Only set when intermediate_kv is not None.
+        kv_buffer_qkv_dim: Optional[int] = None
 
     def __init__(
         self,
@@ -253,6 +273,7 @@ class MambaPool:
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        use_kv_buffer: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -316,22 +337,13 @@ class MambaPool:
                         temporal_state_shape[-1],
                         temporal_state_shape[-2],
                     )
-                # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                intermediate_ssm_state_cache = torch.zeros(
-                    size=(
-                        num_mamba_layers,
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
-                    ),
-                    dtype=ssm_dtype,
-                    device="cuda",
-                )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
+                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim0, dim1]
+                # Uses the same layout as conv_state_shape so that
+                # fused_mamba_state_scatter_with_mask can scatter directly.
+                # Backends that use a transposed conv state (e.g. KDA) must
+                # transpose the intermediate cache before passing to
+                # causal_conv1d_update.
                 intermediate_conv_window_cache = [
                     torch.zeros(
                         size=(
@@ -346,20 +358,78 @@ class MambaPool:
                     )
                     for conv_shape in conv_state_shape
                 ]
-                self.mamba_cache = self.SpeculativeState(
-                    conv=conv_state,
-                    temporal=temporal_state,
-                    intermediate_ssm=intermediate_ssm_state_cache,
-                    intermediate_conv_window=intermediate_conv_window_cache,
-                )
-                logger.info(
-                    f"Mamba Cache is allocated. "
-                    f"max_mamba_cache_size: {size}, "
-                    f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
-                    f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
-                    f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
-                    f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
-                )
+
+                if use_kv_buffer:
+                    # KV buffer mode: store lightweight per-token vectors
+                    # (mixed_qkv, a, b) instead of full O(d^2) SSM states.
+                    # qkv_dim is the feature dimension of the conv state (the
+                    # larger axis, since the other axis is conv_kernel - 1).
+                    qkv_dim = max(conv_state_shape[0])
+                    hv = temporal_state_shape[0]  # num_v_heads / tp
+                    if isinstance(cache_params, KimiLinearCacheParams):
+                        # KDA: a has HV*K elements per token (vector gate).
+                        k_dim = temporal_state_shape[1]  # head_k_dim
+                        a_dim_per_token = hv * k_dim
+                    else:
+                        # GDN: a has HV elements per token (scalar gate).
+                        a_dim_per_token = hv
+                    # mixed_qkv (qkv_dim) + a (a_dim_per_token) + b (hv)
+                    kv_buffer_dim = qkv_dim + a_dim_per_token + hv
+                    intermediate_kv_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            kv_buffer_dim,
+                        ),
+                        dtype=conv_dtype,
+                        device="cuda",
+                    )
+                    self.mamba_cache = self.SpeculativeState(
+                        conv=conv_state,
+                        temporal=temporal_state,
+                        intermediate_ssm=None,
+                        intermediate_conv_window=intermediate_conv_window_cache,
+                        intermediate_kv=intermediate_kv_cache,
+                        kv_buffer_qkv_dim=qkv_dim,
+                    )
+                    logger.info(
+                        f"Mamba Cache is allocated (KV buffer mode). "
+                        f"max_mamba_cache_size: {size}, "
+                        f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                        f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                        f"intermediate_kv_cache size: {get_tensor_size_bytes(intermediate_kv_cache) / GB:.2f}GB "
+                        f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
+                    )
+                else:
+                    # Legacy mode: cache full intermediate SSM states per draft token
+                    # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                    intermediate_ssm_state_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            temporal_state_shape[0],
+                            temporal_state_shape[1],
+                            temporal_state_shape[2],
+                        ),
+                        dtype=ssm_dtype,
+                        device="cuda",
+                    )
+                    self.mamba_cache = self.SpeculativeState(
+                        conv=conv_state,
+                        temporal=temporal_state,
+                        intermediate_ssm=intermediate_ssm_state_cache,
+                        intermediate_conv_window=intermediate_conv_window_cache,
+                    )
+                    logger.info(
+                        f"Mamba Cache is allocated. "
+                        f"max_mamba_cache_size: {size}, "
+                        f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                        f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                        f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
+                        f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
+                    )
             else:
                 self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
                 logger.info(
@@ -434,9 +504,16 @@ class MambaPool:
         for field in vars(self.mamba_cache):
             # Skip intermediate buffers used only for speculative decoding
             # These buffers have different size (spec_state_size + 1) and should not be transferred
-            if field in ("intermediate_ssm", "intermediate_conv_window"):
+            if field in (
+                "intermediate_ssm",
+                "intermediate_conv_window",
+                "intermediate_kv",
+                "kv_buffer_qkv_dim",
+            ):
                 continue
             value = getattr(self.mamba_cache, field)
+            if value is None:
+                continue
             if isinstance(value, list):
                 state_tensors.extend(value)
             else:
@@ -534,6 +611,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
     ):
+        # KV buffer mode: enabled by env var, only for chain drafts (topk <= 1).
+        # The topk constraint is enforced at runtime in the GDN backend; here we
+        # only gate allocation by the env var flag.
+        use_kv_buffer = (
+            speculative_num_draft_tokens is not None
+            and envs.SGLANG_ENABLE_SPEC_KV_BUFFER.get()
+        )
         self.mamba_pool = MambaPool(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,
@@ -542,6 +626,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            use_kv_buffer=use_kv_buffer,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

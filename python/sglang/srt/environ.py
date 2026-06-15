@@ -649,6 +649,11 @@ class Envs:
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
+    # KV-buffer optimization for spec decode target verification on linear
+    # attention (GDN/KDA) models. Caches lightweight KV vectors instead of
+    # full O(d^2) SSM states during verification, then replays accepted KVs
+    # via recurrent update. Only effective for topk <= 1 (chain drafts).
+    SGLANG_ENABLE_SPEC_KV_BUFFER = EnvBool(False)
 
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
