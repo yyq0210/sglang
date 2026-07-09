@@ -79,6 +79,20 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.mamba_cow_src_indices,
                     forward_batch.mamba_cow_dst_indices,
                 )
+        # Head-aware Route-A: load_to_active wrote global@P and set the re-prefill mask
+        # (local rows zeroed). Copy the reconstructed local rows from the scratch slots
+        # (filled by a prior recon forward) into the active slots, then clear the mask.
+        # Runs here so it is strictly after load_to_active and before the GDN kernel reads
+        # the active slot in this same (suffix) forward.
+        reprefill = getattr(forward_batch, "head_aware_reprefill", None)
+        if reprefill is not None:
+            ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
+            ckpt_pool.copy_local_rows_from_scratch(
+                self.req_to_token_pool.mamba_pool,
+                reprefill.scratch_mamba_slots,
+                reprefill.active_mamba_slots,
+            )
+            forward_batch.head_aware_reprefill = None
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None

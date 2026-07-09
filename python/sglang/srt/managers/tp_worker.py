@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -479,6 +480,66 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
+    def _maybe_run_head_aware_reprefill(self, batch: ScheduleBatch):
+        """Route-A head-aware GDN re-prefill seam (M2).
+
+        On a prefix-cache-hit extend batch, reconstruct the local-head mamba rows that
+        Route A drops: run a SEPARATE full-model extend over each hit's last-W prefix
+        tokens into a scratch mamba slot (all heads zero-started at the window base),
+        then hand back a ``HeadAwareReprefillBatch`` whose masked copy the caller attaches
+        to the suffix forward. Runs inside the same forward-stream/isolation context as the
+        suffix (both are ``forward_batch_generation`` calls on this worker), so the triple
+        recon -> copy -> suffix is strictly forward-stream-ordered.
+
+        Returns the reprefill struct (to attach to the suffix forward) or None when the
+        seam is off / not applicable / no reconstructable hits.
+        """
+        if not envs.SGLANG_ENABLE_HEAD_AWARE_REPREFILL.get():
+            return None
+        if batch.forward_mode is None or not batch.forward_mode.is_extend():
+            return None
+        from sglang.srt.mem_cache.head_aware_reprefill import (
+            build_reprefill_batch,
+            free_recon_scratch_kv,
+            iter_recon_chunks,
+        )
+
+        built = build_reprefill_batch(batch, self.model_runner)
+        if built is None:
+            return None
+        recon_reqs, recon_win_lens, reprefill = built
+
+        # Recon forward(s): fill scratch slots with the window-rolled state@P. Concurrent
+        # hits drain in WAVES each bounded by the prefill buffer ceiling AND the free
+        # req-pool slots, so a burst neither overflows the eager input buffer nor
+        # out-competes the live batch for req slots. Logits are discarded;
+        # mamba_cow_src_indices=None + mamba_clear_indices=scratch make the deferred-COW
+        # hook ZERO the scratch (not COW-load global@P into it). Each wave's req-pool + KV
+        # slots are freed right after its forward (before the next wave is built) so the
+        # freed slots are restored; the scratch MAMBA slots persist until the suffix
+        # forward's masked copy reads them (freed in forward_batch_generation).
+        for recon_batch in iter_recon_chunks(
+            recon_reqs, recon_win_lens, batch, self.model_runner
+        ):
+            recon_fb = ForwardBatch.init_new(recon_batch, self.model_runner)
+            recon_fb.head_aware_reprefill = None
+            self.model_runner.forward(recon_fb)
+            free_recon_scratch_kv(recon_batch, self.model_runner)
+        return reprefill
+
+    def _free_head_aware_reprefill_scratch(self, reprefill) -> None:
+        """Release the Route-A recon scratch mamba slots after the suffix forward.
+
+        Called right after ``model_runner.forward`` on the suffix batch: the masked copy
+        (inside that forward's deferred-COW hook) has finished reading the scratch slots,
+        so they can go back to the mamba allocator. No-op when re-prefill is inactive.
+        """
+        if reprefill is None:
+            return
+        from sglang.srt.mem_cache.head_aware_reprefill import free_recon_scratch_mamba
+
+        free_recon_scratch_mamba(reprefill, self.model_runner)
+
     def forward_batch_generation(
         self,
         batch: Optional[ScheduleBatch],
@@ -487,12 +548,22 @@ class TpModelWorker(BaseTpWorker):
         is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
     ) -> GenerationBatchResult:
+        # Route-A head-aware re-prefill state, held across the suffix forward so its
+        # scratch mamba slots can be freed after the masked copy reads them.
+        reprefill = None
         # Get forward batch from schedule batch
         if batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
+            reprefill = self._maybe_run_head_aware_reprefill(batch)
+
             forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+            if reprefill is not None:
+                # Attach so the suffix forward's deferred-COW hook copies the
+                # reconstructed local-head rows into the active slots right after
+                # load_to_active writes global@P (see hybrid_linear_attn_backend).
+                forward_batch.head_aware_reprefill = reprefill
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
@@ -508,6 +579,7 @@ class TpModelWorker(BaseTpWorker):
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            self._free_head_aware_reprefill_scratch(reprefill)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -564,6 +636,7 @@ class TpModelWorker(BaseTpWorker):
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            self._free_head_aware_reprefill_scratch(reprefill)
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,

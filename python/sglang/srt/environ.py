@@ -683,6 +683,25 @@ class Envs:
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
+    # Head-aware GDN checkpoint: force the global/local tau threshold (build_plan
+    # w_max). Expert A/B knob only. Unset -> plan default (4096). Set 0 to force
+    # ALL heads global (an exact same-precision dense checkpoint, the fair capacity
+    # baseline against Route A/B selective storage).
+    SGLANG_FORCE_HEAD_AWARE_WMAX = EnvInt(None)
+    # Head-aware GDN checkpoint Route A: on a prefix-cache hit, re-prefill the last-W
+    # prefix tokens through the full model to fill the local heads that Route A drops
+    # (load_to_active leaves them zeroed + sets mamba_head_reprefill_mask). Gates the
+    # whole scheduler/tp_worker reconstruction seam. Off -> local rows stay zeroed
+    # (approximation, no reconstruction).
+    SGLANG_ENABLE_HEAD_AWARE_REPREFILL = EnvBool(False)
+    # Head-aware GDN checkpoint Route A "seam window" (Hypic C2): DECOUPLE the
+    # reconstruction window from the tau split. The tau global/local split still uses
+    # plan.W_max (capacity口径 unchanged), but the per-hit re-prefill only rolls the
+    # last min(seam, W_max) tokens instead of the full W_max. Cuts t_recon from
+    # O(W_max) to O(seam) at fixed capacity. Unset/<=0 -> full W_max (legacy behavior).
+    # Local heads with tau > seam are only PARTIALLY reconstructed -> accuracy is an
+    # empirical question (gsm8k judges it).
+    SGLANG_HEAD_AWARE_SEAM_WINDOW = EnvInt(None)
 
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)

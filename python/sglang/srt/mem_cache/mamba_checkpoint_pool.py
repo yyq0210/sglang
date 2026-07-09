@@ -48,10 +48,11 @@ lifecycle is owned by the caller via the embedded ``MambaSlotAllocator``.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.attention.fla.gdn_head_aware import gdn_step, plan_windows
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 
 logger = logging.getLogger(__name__)
@@ -369,5 +370,784 @@ def maybe_init_int8_mamba_checkpoint_pool(
         f"int8 mamba checkpoint pool ({est['total'] / GB:.2f}GB) is allocated from "
         f"--mem-fraction-static headroom and is not reflected in "
         f"max_total_num_tokens; ensure headroom covers it."
+    )
+    return pool
+
+
+# ---------------------------------------------------------------------------
+# Head-aware checkpoint store (Route A / Route B)
+# ---------------------------------------------------------------------------
+#
+# Where int8 shrinks EVERY cached (head, k-channel) uniformly to 1 byte, the
+# head-aware store shrinks by DROPPING whole heads whose decay tau does not
+# outlive the reconstruction window W:
+#
+#   * global head (tau_h > W): memory outlives the window -> store the EXACT
+#     [d_v, d_k] state (what the radix caches today).
+#   * local head  (tau_h <= W): the state is ~the contribution of the last W
+#     tokens -> do NOT store the [d_v, d_k] state.
+#       - Route B: store the last-W (k, v, g, beta) window and, on a hit, REPLAY
+#         it through one GDN layer's recurrence (gdn_head_aware.gdn_step).
+#       - Route A: store NOTHING for local heads; on a hit re-prefill the last-W
+#         prefix tokens through the full model (scheduler-side; the store leaves
+#         local rows zeroed and reports which heads need re-prefill).
+#
+# The plan (which heads are global) is per GDN LAYER (each layer has its own
+# A_log / dt_bias), so the packed layout pads to G_max = max over layers of the
+# global-head count and keeps a per-layer head-id map. bytes/slot < the dense
+# [L, HV, d_v, d_k] baseline -> more checkpoint slots at fixed HBM == the real
+# capacity gain this experiment measures.
+#
+# NOTE: the Route-B (k, v, g, beta) window is a transient GDN-forward product and
+# is NOT resident in the active MambaPool (which holds only the temporal state S
+# and the conv window). So the pool-facing ``store_from_active`` faithfully packs
+# the GLOBAL-head state from the pool; the local-head window (Route B) / token-id
+# re-prefill (Route A) must be supplied by the GDN-forward capture seam, which is
+# the GPU-side M1/M2 integration. The tensor-level ``store``/``load`` below carry
+# the full head-aware math and are what the offline correctness test drives.
+
+try:
+    import msgspec
+
+    _StructBase = msgspec.Struct
+except Exception:  # msgspec is a hard dep in sglang; guard only for odd envs
+    _StructBase = object
+
+
+class HeadAwarePlan(_StructBase):
+    """Static per-(layer, head) classification for the head-aware store.
+
+    Built ONCE from the model's stacked GDN weights (``build_plan``). Route only
+    decides how LOCAL heads are reconstructed (B: window replay; A: re-prefill);
+    the global/local split itself is route-independent (same ``plan_windows``).
+
+    Fields:
+      route       : "A" or "B".
+      w_head      : [L, HV] int64 — 0 = global (store exact state); W>0 = local.
+      global_idx  : [L, G_max] int64 — head-id of each packed global row (-1 pad).
+      local_idx   : [L, Lwin_max] int64 — head-id of each local row (-1 pad).
+      local_w     : [L, Lwin_max] int64 — per-local window length W (0 pad).
+      G_max, Lwin_max, W_max : packed dimensions (max over layers).
+      HV, d_v, d_k : per-head state dims.
+    """
+
+    route: str
+    w_head: torch.Tensor
+    global_idx: torch.Tensor
+    local_idx: torch.Tensor
+    local_w: torch.Tensor
+    G_max: int
+    Lwin_max: int
+    W_max: int
+    HV: int
+    d_v: int
+    d_k: int
+
+    @classmethod
+    def build_plan(
+        cls,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        route: str,
+        d_k: int,
+        d_v: int,
+        eps: float = 1e-3,
+        w_max: int = 4096,
+        w_min: int = 4,
+        a_margin: float = 0.3,
+    ) -> HeadAwarePlan:
+        """Compute the per-layer window plan from stacked GDN weights.
+
+        A_log / dt_bias: [L, HV] (per layer, per v-head; the static decay weights
+        read from each GDN layer, e.g. Qwen3-Next ``*.A_log`` / ``*.dt_bias``).
+        Classify at a slightly NEGATIVE ``a`` (= -a_margin, slower decay) so the
+        window covers real per-token a<0 fluctuations (mirrors the offline test).
+        """
+        from sglang.srt.layers.attention.fla.gdn_head_aware import (
+            _next_pow2,
+            gdn_gate,
+            tau_from_g,
+        )
+
+        assert route in ("A", "B"), f"head_aware_route must be A/B, got {route!r}"
+        assert A_log.dim() == 2 and A_log.shape == dt_bias.shape
+        L, HV = A_log.shape
+        # the plan is a one-time static computation; do it on CPU so it never
+        # depends on the caller's device (build_plan tensors are CPU scratch).
+        A_log = A_log.detach().cpu().to(torch.float64)
+        dt_bias = dt_bias.detach().cpu().to(torch.float64)
+
+        w_rows: List[torch.Tensor] = []
+        for l in range(L):
+            g_repr = gdn_gate(
+                torch.full((HV,), -a_margin, dtype=torch.float64),
+                A_log[l],
+                dt_bias[l],
+            )
+            if route == "B":
+                # Route B stores a window, so windowize a head ONLY when the window
+                # is BOTH correct (W >= tau) AND cheaper than the [d_v,d_k] state
+                # (the plan_windows break-even ~ 64 at 128x128).
+                w_rows.append(
+                    plan_windows(
+                        g_repr, eps, d_k=d_k, d_v=d_v, w_max=w_max, w_min=w_min
+                    )
+                )
+            else:
+                # Route A stores NOTHING for a local head (re-prefilled on a hit),
+                # so a dropped head always costs 0 bytes -> no break-even gate: drop
+                # EVERY head whose memory is coverable by a re-prefill window
+                # (tau <= w_max). w_max is the global/local threshold knob (heads
+                # with tau > w_max keep the exact state).
+                tau = tau_from_g(g_repr, eps)
+                w = torch.zeros(HV, dtype=torch.int64)
+                local = torch.isfinite(tau) & (tau <= float(w_max))
+                for h in torch.nonzero(local, as_tuple=False).flatten().tolist():
+                    w[h] = min(max(_next_pow2(tau[h].item()), w_min), w_max)
+                w_rows.append(w)
+        w_head = torch.stack(w_rows, dim=0)  # [L, HV] int64
+
+        is_global = w_head == 0
+        n_global = is_global.sum(dim=1)  # [L]
+        is_local = w_head > 0
+        n_local = is_local.sum(dim=1)  # [L]
+        G_max = int(n_global.max().item()) if L else 0
+        Lwin_max = int(n_local.max().item()) if L else 0
+        W_max = int(w_head.max().item()) if bool(is_local.any()) else 0
+
+        global_idx = torch.full((L, max(G_max, 1)), -1, dtype=torch.int64)
+        local_idx = torch.full((L, max(Lwin_max, 1)), -1, dtype=torch.int64)
+        local_w = torch.zeros((L, max(Lwin_max, 1)), dtype=torch.int64)
+        for l in range(L):
+            g = torch.nonzero(is_global[l], as_tuple=False).flatten()
+            global_idx[l, : g.numel()] = g
+            lo = torch.nonzero(is_local[l], as_tuple=False).flatten()
+            local_idx[l, : lo.numel()] = lo
+            local_w[l, : lo.numel()] = w_head[l, lo]
+
+        return cls(
+            route=route,
+            w_head=w_head,
+            global_idx=global_idx,
+            local_idx=local_idx,
+            local_w=local_w,
+            G_max=G_max,
+            Lwin_max=Lwin_max,
+            W_max=W_max,
+            HV=HV,
+            d_v=d_v,
+            d_k=d_k,
+        )
+
+
+class HeadAwareCheckpointStore:
+    """Packed head-aware store for cached multi-layer GDN states.
+
+    Layout (slot index handed out by the caller's allocator):
+        state_buf : [L, num_slots, G_max, d_v, d_k]  — exact state, GLOBAL rows only
+      Route B additionally:
+        win_k     : [L, num_slots, Lwin_max, W_max, d_k]
+        win_v     : [L, num_slots, Lwin_max, W_max, d_v]
+        win_g     : [L, num_slots, Lwin_max, W_max]
+        win_beta  : [L, num_slots, Lwin_max, W_max]
+
+    ``load`` returns the full dense [L, N, HV, d_v, d_k] state: global rows copied
+    verbatim; local rows replayed from the window (Route B) or left zero with a
+    ``local_needs_reprefill`` mask (Route A, filled by the scheduler re-prefill).
+    """
+
+    def __init__(
+        self,
+        *,
+        plan: HeadAwarePlan,
+        num_slots: int,
+        device: str,
+        state_dtype: torch.dtype = torch.bfloat16,
+        win_dtype: torch.dtype = torch.bfloat16,
+    ):
+        self.plan = plan
+        self.num_slots = num_slots
+        self.device = device
+        self.state_dtype = state_dtype
+        L = plan.global_idx.shape[0]
+        self.L = L
+        # move static plan tensors onto the store's device once
+        self.global_idx = plan.global_idx.to(device)
+        self.local_idx = plan.local_idx.to(device)
+        self.local_w = plan.local_w.to(device)
+        # valid (non-pad) global rows per layer, for scatter on load
+        self._g_valid = self.global_idx >= 0  # [L, G_max]
+
+        self.state_buf = torch.empty(
+            L,
+            num_slots,
+            max(plan.G_max, 1),
+            plan.d_v,
+            plan.d_k,
+            dtype=state_dtype,
+            device=device,
+        )
+        self.route_b = plan.route == "B" and plan.Lwin_max > 0 and plan.W_max > 0
+        if self.route_b:
+            self.win_k = torch.empty(
+                L,
+                num_slots,
+                plan.Lwin_max,
+                plan.W_max,
+                plan.d_k,
+                dtype=win_dtype,
+                device=device,
+            )
+            self.win_v = torch.empty(
+                L,
+                num_slots,
+                plan.Lwin_max,
+                plan.W_max,
+                plan.d_v,
+                dtype=win_dtype,
+                device=device,
+            )
+            self.win_g = torch.empty(
+                L,
+                num_slots,
+                plan.Lwin_max,
+                plan.W_max,
+                dtype=win_dtype,
+                device=device,
+            )
+            self.win_beta = torch.empty(
+                L,
+                num_slots,
+                plan.Lwin_max,
+                plan.W_max,
+                dtype=win_dtype,
+                device=device,
+            )
+
+    # ---- tensor-level store / load (offline-testable; caller supplies slots) --
+
+    @staticmethod
+    def _as_slots(slots) -> torch.Tensor:
+        if not torch.is_tensor(slots):
+            slots = torch.as_tensor([slots], dtype=torch.int64)
+        return slots.flatten()
+
+    def store(
+        self,
+        slots,
+        states: torch.Tensor,
+        windows: Optional[dict] = None,
+        windows_packed: bool = False,
+    ) -> None:
+        """Pack states into checkpoint ``slots``.
+
+        states  : [L, N, HV, d_v, d_k] (or [L, HV, d_v, d_k] for a single slot).
+        windows : Route B only — dict with k[L,N,W_max,HV,d_k], v[...,d_v],
+                  g[L,N,W_max,HV], beta[L,N,W_max,HV] (or without the N axis for
+                  a single slot). Each local head reads only its own w_head suffix.
+                  When ``windows_packed`` is True the dict is instead already in the
+                  store's packed local-head layout (k[L,N,Lwin_max,W_max,d_k], ...),
+                  as produced by the GDN-forward window capturer — copied verbatim,
+                  no per-head gather.
+        """
+        slots = self._as_slots(slots)
+        if states.dim() == 4:
+            states = states.unsqueeze(1)
+        N = slots.numel()
+        assert states.shape[1] == N, f"{states.shape[1]} states for {N} slots"
+        for l in range(self.L):
+            gi = self.global_idx[l].clamp(min=0)  # [G_max]; pad rows -> head 0
+            # states[l]: [N, HV, d_v, d_k] -> gather global rows -> [N, G_max, d_v, d_k]
+            self.state_buf[l, slots] = states[l][:, gi].to(self.state_dtype)
+        if self.route_b:
+            assert windows is not None, "Route B store needs the (k,v,g,beta) window"
+            if windows_packed:
+                self._store_windows_packed(slots, windows)
+            else:
+                self._store_windows(slots, windows)
+
+    def _store_windows_packed(self, slots: torch.Tensor, windows: dict) -> None:
+        """Copy already-packed local-head windows straight into the win_* buffers.
+
+        windows[*] are laid out [L, N, Lwin_max, W_max, d_*] (g/beta drop the last
+        axis) — the layout the GDN-forward capturer maintains per active slot, so
+        the store is a pure per-slot copy with no local_idx gather."""
+        k, v, g, beta = windows["k"], windows["v"], windows["g"], windows["beta"]
+        self.win_k[:, slots] = k.to(self.win_k.dtype)
+        self.win_v[:, slots] = v.to(self.win_v.dtype)
+        self.win_g[:, slots] = g.to(self.win_g.dtype)
+        self.win_beta[:, slots] = beta.to(self.win_beta.dtype)
+
+    def _store_windows(self, slots: torch.Tensor, windows: dict) -> None:
+        k, v, g, beta = windows["k"], windows["v"], windows["g"], windows["beta"]
+        if k.dim() == 4:  # add N axis for single slot
+            k, v = k.unsqueeze(1), v.unsqueeze(1)
+            g, beta = g.unsqueeze(1), beta.unsqueeze(1)
+        for l in range(self.L):
+            li = self.local_idx[l].clamp(min=0)  # [Lwin_max]
+            # k[l]: [N, W_max, HV, d_k] -> [N, Lwin_max, W_max, d_k]
+            self.win_k[l, slots] = k[l][:, :, li].transpose(1, 2).to(self.win_k.dtype)
+            self.win_v[l, slots] = v[l][:, :, li].transpose(1, 2).to(self.win_v.dtype)
+            self.win_g[l, slots] = g[l][:, :, li].transpose(1, 2).to(self.win_g.dtype)
+            self.win_beta[l, slots] = (
+                beta[l][:, :, li].transpose(1, 2).to(self.win_beta.dtype)
+            )
+
+    def load(
+        self, slots, out_dtype: torch.dtype, l2norm_k: bool = True
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Reconstruct dense [L, N, HV, d_v, d_k] states at ``slots``.
+
+        Returns (states, local_needs_reprefill). For Route A the second element is
+        a [L, HV] bool mask of local heads left zeroed (the scheduler re-prefills
+        them); for Route B it is None (local heads are replayed here).
+        """
+        slots = self._as_slots(slots)
+        N = slots.numel()
+        HV, d_v, d_k = self.plan.HV, self.plan.d_v, self.plan.d_k
+        out = torch.zeros(self.L, N, HV, d_v, d_k, dtype=out_dtype, device=self.device)
+        for l in range(self.L):
+            valid = self._g_valid[l]
+            if valid.any():
+                heads = self.global_idx[l][valid]  # real head ids
+                out[l][:, heads] = self.state_buf[l, slots][:, valid].to(out_dtype)
+        if self.route_b:
+            self._replay_windows(slots, out, l2norm_k)
+            return out, None
+        # Route A: local heads stay zero; report the mask for scheduler re-prefill
+        return out, (self.plan.w_head.to(self.device) > 0)
+
+    def _replay_windows(
+        self, slots: torch.Tensor, out: torch.Tensor, l2norm_k: bool
+    ) -> None:
+        N = slots.numel()
+        for l in range(self.L):
+            li = self.local_idx[l]
+            valid = li >= 0
+            if not valid.any():
+                continue
+            heads = li[valid]  # [n_local]
+            wl = self.local_w[l][valid]  # [n_local] window length per local head
+            # replay per slot (N is small on a hit; usually 1) grouping by window W
+            for n in range(N):
+                s = slots[n]
+                for W in sorted({int(x) for x in wl.tolist()}):
+                    sel = (wl == W).nonzero(as_tuple=False).flatten()
+                    h = heads[sel]  # global head ids for this W group
+                    pos = valid.nonzero(as_tuple=False).flatten()[sel]  # packed rows
+                    S = torch.zeros(
+                        h.numel(),
+                        self.plan.d_v,
+                        self.plan.d_k,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    base = self.plan.W_max - W  # last W of the stored window
+                    for t in range(base, self.plan.W_max):
+                        S = gdn_step(
+                            S,
+                            self.win_k[l, s, pos, t].float(),
+                            self.win_v[l, s, pos, t].float(),
+                            self.win_g[l, s, pos, t].float(),
+                            self.win_beta[l, s, pos, t].float(),
+                            l2norm_k,
+                        )
+                    out[l, n, h] = S.to(out.dtype)
+
+    # ---- byte accounting (capacity) ----
+
+    def mem_usage_bytes(self) -> int:
+        total = self.state_buf.numel() * self.state_buf.element_size()
+        if self.route_b:
+            for t in (self.win_k, self.win_v, self.win_g, self.win_beta):
+                total += t.numel() * t.element_size()
+        return total
+
+    def bytes_per_slot(self) -> int:
+        return self.mem_usage_bytes() // max(1, self.num_slots)
+
+    @staticmethod
+    def dense_bytes_per_slot(
+        *,
+        num_layers: int,
+        num_heads: int,
+        head_v_dim: int,
+        head_k_dim: int,
+        state_dtype: torch.dtype,
+    ) -> int:
+        isz = torch.empty((), dtype=state_dtype).element_size()
+        return num_layers * num_heads * head_v_dim * head_k_dim * isz
+
+
+class HeadAwareWindowCapturer:
+    """Captures the Route-B last-W (k, v, g, beta) local-head window per active
+    mamba slot during GDN prefill, so the checkpoint store can donate it on evict.
+
+    The window is a transient GDN-forward product (post-conv key, value, and the
+    fused decay/beta gates) that is NOT resident in the active MambaPool — only the
+    recurrent state S and the conv state are. So the store cannot reconstruct it
+    from pool memory; instead this capturer maintains a per-active-slot ring in the
+    store's PACKED local-head layout ([L, mamba_slots, Lwin_max, W_max, d]) and
+    exposes ``provider(active_slots)`` (registered via
+    ``HeadAwareCheckpointPool.attach_window_provider``) that slices out the windows
+    for the slots being donated.
+
+    Only local (windowized) heads are stored, right-aligned in the W_max axis
+    (matching the store's suffix replay ``base = W_max - W``). Sequences longer than
+    W_max keep just the last W_max tokens; the common shared-prefix case (system
+    prompt >> W_max) always captures a full, exact window. A partial capture (a
+    prefill that extends a already-cached prefix with fewer than W new tokens) is
+    left approximate — the leading zero rows only affect a head whose own window W
+    exceeds the tokens seen in this forward.
+    """
+
+    def __init__(self, store, mamba_map, num_slots: int, device: str, dtype):
+        self.store = store
+        self.mamba_map = mamba_map  # global layer_id -> mamba/plan ordinal
+        self.num_slots = num_slots
+        self.device = device
+        plan = store.plan
+        L = store.L
+        Lw = max(plan.Lwin_max, 1)
+        W = plan.W_max
+        self.W_max = W
+        self.local_idx = store.local_idx  # [L, Lwin_max] on device, -1 pad
+        self._valid = self.local_idx >= 0  # [L, Lwin_max]
+        self.cap_k = torch.zeros(
+            L, num_slots, Lw, W, plan.d_k, dtype=dtype, device=device
+        )
+        self.cap_v = torch.zeros(
+            L, num_slots, Lw, W, plan.d_v, dtype=dtype, device=device
+        )
+        self.cap_g = torch.zeros(L, num_slots, Lw, W, dtype=dtype, device=device)
+        self.cap_beta = torch.zeros(L, num_slots, Lw, W, dtype=dtype, device=device)
+
+    @torch.no_grad()
+    def capture_extend(
+        self,
+        layer_id: int,
+        key: torch.Tensor,  # [1, T, num_k_heads, d_k] post-conv, pre-l2norm
+        value: torch.Tensor,  # [1, T, num_v_heads, d_v]
+        g: torch.Tensor,  # [1, T, num_v_heads] log-decay per token
+        beta: torch.Tensor,  # [1, T, num_v_heads]
+        query_start_loc: torch.Tensor,  # [bs+1] token offsets per sequence
+        cache_indices: torch.Tensor,  # [bs] active mamba slot per sequence
+    ) -> None:
+        l = int(self.mamba_map[layer_id])
+        valid = self._valid[l]
+        if not bool(valid.any()):
+            return
+        heads = self.local_idx[l][valid]  # local v-head ids [n]
+        n = heads.numel()
+
+        k = key[0]  # [T, num_k_heads, d_k]
+        v = value[0]  # [T, num_v_heads, d_v]
+        gg = g[0]  # [T, num_v_heads]
+        bb = beta[0]
+        num_k_heads = k.shape[1]
+        num_v_heads = v.shape[1]
+        group = num_v_heads // max(1, num_k_heads)
+        # expand the (grouped) key heads out to v-heads, then gather local heads
+        k_v = k.repeat_interleave(group, dim=1) if group > 1 else k
+        k_l = k_v[:, heads]  # [T, n, d_k]
+        v_l = v[:, heads]  # [T, n, d_v]
+        g_l = gg[:, heads]  # [T, n]
+        b_l = bb[:, heads]
+
+        qsl = query_start_loc.tolist()
+        slots = cache_indices.tolist()
+        W = self.W_max
+        for i in range(len(slots)):
+            slot = slots[i]
+            if slot is None or slot < 0:
+                continue
+            s, e = int(qsl[i]), int(qsl[i + 1])
+            wlen = min(e - s, W)
+            if wlen <= 0:
+                continue
+            src = slice(e - wlen, e)
+            dst = slice(W - wlen, W)  # right-align (store replays the suffix)
+            self.cap_k[l, slot, :n, dst] = k_l[src].transpose(0, 1).to(self.cap_k.dtype)
+            self.cap_v[l, slot, :n, dst] = v_l[src].transpose(0, 1).to(self.cap_v.dtype)
+            self.cap_g[l, slot, :n, dst] = g_l[src].transpose(0, 1).to(self.cap_g.dtype)
+            self.cap_beta[l, slot, :n, dst] = (
+                b_l[src].transpose(0, 1).to(self.cap_beta.dtype)
+            )
+
+    def provider(self, active_slots) -> dict:
+        """Return the packed local-head windows for ``active_slots`` (the donation
+        set), in the store's ``_store_windows_packed`` layout."""
+        if not torch.is_tensor(active_slots):
+            active_slots = torch.as_tensor(
+                active_slots, dtype=torch.int64, device=self.device
+            )
+        slots = active_slots.flatten().to(self.cap_k.device)
+        return {
+            "k": self.cap_k[:, slots],
+            "v": self.cap_v[:, slots],
+            "g": self.cap_g[:, slots],
+            "beta": self.cap_beta[:, slots],
+        }
+
+
+class HeadAwareCheckpointPool:
+    """Radix checkpoint pool backed by ``HeadAwareCheckpointStore``.
+
+    Duck-types ``MambaCheckpointPool`` (same alloc/free/available_size/clear/
+    store_from_active/load_to_active) so it drops into the SAME radix seam sites
+    (``_commit_int8_checkpoint`` -> store_from_active, ``_free_mamba_value`` ->
+    free, the COW load -> load_to_active) with no hook changes — memory_pool just
+    assigns whichever pool is enabled to ``mamba_ckpt_pool``.
+
+    The GDN decay plan needs the model's per-layer A_log/dt_bias, which are NOT
+    available at pool construction (before weights load). So the plan / packed
+    buffers are built lazily via ``set_plan`` (called once from the model runner
+    after weights land). Until then the pool holds only the allocator + conv
+    buffers and reports ``available_size()==0`` so the radix never donates into it.
+
+    Local-head reconstruction inputs (Route B: the (k,v,g,beta) window; Route A:
+    the last-W prefix token ids) are a transient GDN-forward product, not resident
+    in the active MambaPool. They are supplied by an attached ``window_provider``
+    (slot -> window dict) / re-prefill hook, which the GDN backend/scheduler
+    populates during prefill — the GPU-side M1/M2 integration. Global-head state +
+    conv (both pool-resident) are transferred faithfully here regardless.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_slots: int,
+        num_layers: int,
+        num_heads: int,
+        head_v_dim: int,
+        head_k_dim: int,
+        conv_shapes: List[tuple],
+        conv_dtype: torch.dtype,
+        device: str,
+        route: str,
+        temporal_dtype: torch.dtype,
+        eps: float = 1e-3,
+        w_max: int = 4096,
+    ):
+        self.num_slots = num_slots
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_v_dim = head_v_dim
+        self.head_k_dim = head_k_dim
+        self.device = device
+        self.route = route
+        self.temporal_dtype = temporal_dtype
+        self.eps = eps
+        self.w_max = w_max
+        self.store: Optional[HeadAwareCheckpointStore] = None
+        self.window_provider = None  # callable(slots)->windows dict (Route B)
+        # conv windows are plan-independent (tiny; not head-classified) -> allocate now
+        self.conv = [
+            torch.empty(
+                (num_layers, num_slots + 1) + tuple(shape),
+                dtype=conv_dtype,
+                device=device,
+            )
+            for shape in conv_shapes
+        ]
+        self.allocator = MambaSlotAllocator(size=num_slots, device=device)
+
+    # ---- lazy plan (needs model weights) ----
+
+    def set_plan(self, A_log: torch.Tensor, dt_bias: torch.Tensor) -> None:
+        """Build the per-layer head plan + packed buffers from stacked GDN weights.
+        A_log / dt_bias: [num_layers, num_heads]."""
+        plan = HeadAwarePlan.build_plan(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            route=self.route,
+            d_k=self.head_k_dim,
+            d_v=self.head_v_dim,
+            eps=self.eps,
+            w_max=self.w_max,
+        )
+        self.store = HeadAwareCheckpointStore(
+            plan=plan,
+            num_slots=self.num_slots + 1,  # slot 0 reserved (matches allocator)
+            device=self.device,
+            state_dtype=self.temporal_dtype,
+            win_dtype=self.temporal_dtype,
+        )
+        GB = 1 << 30
+        dense = HeadAwareCheckpointStore.dense_bytes_per_slot(
+            num_layers=self.num_layers,
+            num_heads=self.num_heads,
+            head_v_dim=self.head_v_dim,
+            head_k_dim=self.head_k_dim,
+            state_dtype=self.temporal_dtype,
+        )
+        logger.info(
+            f"head-aware mamba checkpoint pool (route {self.route}): plan built, "
+            f"bytes/slot={self.store.bytes_per_slot()} vs dense {dense} "
+            f"({dense / max(1, self.store.bytes_per_slot()):.2f}x capacity); "
+            f"{self.mem_usage_bytes() / GB:.2f}GB over {self.num_slots} slots"
+        )
+
+    def attach_window_provider(self, provider) -> None:
+        """Register the GDN-forward capture: ``provider(active_slots)`` returns the
+        Route-B window dict for those active slots (the M1 live seam)."""
+        self.window_provider = provider
+
+    def maybe_build_window_capturer(
+        self, *, mamba_map, mamba_num_slots: int, dtype
+    ) -> Optional[HeadAwareWindowCapturer]:
+        """Build + attach the Route-B window capturer (called once from the GDN
+        backend init, after ``set_plan``). No-op (returns None) for Route A or when
+        no head windowizes — those paths need no live (k,v,g,beta) capture."""
+        if self.store is None or not self.store.route_b:
+            return None
+        capturer = HeadAwareWindowCapturer(
+            store=self.store,
+            mamba_map=mamba_map,
+            num_slots=mamba_num_slots,
+            device=self.device,
+            dtype=dtype,
+        )
+        self.attach_window_provider(capturer.provider)
+        return capturer
+
+    # ---- lifecycle (delegates to the embedded allocator) ----
+
+    def alloc(self, n: int = 1):
+        if self.store is None:  # plan not set yet -> never donate
+            return None
+        return self.allocator.alloc(n)
+
+    def free(self, slots: torch.Tensor):
+        self.allocator.free(slots)
+
+    def available_size(self) -> int:
+        if self.store is None:
+            return 0
+        return self.allocator.available_size()
+
+    def clear(self) -> None:
+        self.allocator.clear()
+
+    # ---- state transfer between the active MambaPool and this store ----
+
+    def store_from_active(self, active_mamba_pool, active_slots, ckpt_slots) -> None:
+        assert self.store is not None, "head-aware pool used before set_plan()"
+        cache = active_mamba_pool.mamba_cache
+        states = cache.temporal[:, active_slots]  # [L, N, HV, d_v, d_k]
+        windows = None
+        if self.store.route_b:
+            if self.window_provider is None:
+                raise NotImplementedError(
+                    "Route B head-aware store needs the (k,v,g,beta) window, a "
+                    "transient GDN-forward product not resident in MambaPool. Wire "
+                    "the GDN-forward capture via attach_window_provider() (the M1 "
+                    "GPU integration), or use --head-aware-route A."
+                )
+            windows = self.window_provider(active_slots)
+        self.store.store(
+            ckpt_slots, states, windows, windows_packed=windows is not None
+        )
+        for i, c in enumerate(self.conv):
+            c[:, ckpt_slots] = cache.conv[i][:, active_slots]
+
+    def load_to_active(self, active_mamba_pool, ckpt_slots, active_slots) -> None:
+        assert self.store is not None, "head-aware pool used before set_plan()"
+        cache = active_mamba_pool.mamba_cache
+        states, needs_reprefill = self.store.load(ckpt_slots, cache.temporal.dtype)
+        cache.temporal[:, active_slots] = states
+        for i, c in enumerate(self.conv):
+            cache.conv[i][:, active_slots] = c[:, ckpt_slots].to(cache.conv[i].dtype)
+        # Route A leaves local-head rows zeroed; the scheduler must re-prefill the
+        # last-W prefix tokens through the full model to fill them (M2). Surfaced
+        # here as the needs_reprefill mask for the scheduler seam to consume.
+        if needs_reprefill is not None:
+            active_mamba_pool.mamba_head_reprefill_mask = needs_reprefill
+
+    def copy_local_rows_from_scratch(
+        self, active_mamba_pool, scratch_slots, active_slots
+    ) -> None:
+        """Route-A reconstruction step (M2): copy the local-head rows that
+        ``load_to_active`` left zeroed from a scratch mamba slot (window-rolled
+        state@P via a full-model re-prefill of the last-W tokens) into the real
+        active slot. Global-head rows keep the exact checkpoint@P written by
+        ``load_to_active``. Consumes and clears ``mamba_head_reprefill_mask``.
+
+        ``scratch_slots`` / ``active_slots`` are aligned [N] index tensors (one
+        scratch slot per Route-A hit). ``mask[l]`` is a [HV] bool selecting the
+        local heads for layer ``l``.
+        """
+        mask = active_mamba_pool.mamba_head_reprefill_mask
+        if mask is None:
+            return
+        assert self.store is not None, "head-aware pool used before set_plan()"
+        temporal = active_mamba_pool.mamba_cache.temporal  # [L, slots, HV, d_v, d_k]
+        scratch_slots = self.store._as_slots(scratch_slots).to(temporal.device)
+        active_slots = self.store._as_slots(active_slots).to(temporal.device)
+        for l in range(self.store.L):
+            heads = mask[l].nonzero(as_tuple=False).flatten()  # local head ids
+            if heads.numel() == 0:
+                continue
+            # temporal[l] is a view; broadcasting [N,1] x [n_local] writes back
+            # the [N, n_local, d_v, d_k] block into the underlying storage.
+            src = temporal[l][scratch_slots.unsqueeze(1), heads]
+            temporal[l][active_slots.unsqueeze(1), heads] = src
+        active_mamba_pool.mamba_head_reprefill_mask = None
+
+    def mem_usage_bytes(self) -> int:
+        conv_bytes = sum(c.numel() * c.element_size() for c in self.conv)
+        store_bytes = self.store.mem_usage_bytes() if self.store is not None else 0
+        return store_bytes + conv_bytes
+
+
+def maybe_init_head_aware_mamba_checkpoint_pool(
+    *,
+    mamba_size: int,
+    cache_params,
+    mamba_layer_ids: List[int],
+    device: str,
+) -> Optional[HeadAwareCheckpointPool]:
+    """Build the head-aware ``HeadAwareCheckpointPool`` when
+    ``--enable-head-aware-mamba-checkpoint`` is set, else None. Mutually exclusive
+    with the int8 pool (enforced in ServerArgs). Sized so its HBM budget matches
+    what the int8 pool would use (``2 * mamba_size`` dense-equivalent slots), then
+    scaled up by the head-aware byte savings once ``set_plan`` runs is left to a
+    follow-up; for now it allocates ``head_aware_mamba_ckpt_size`` slots (default
+    ``2 * mamba_size``)."""
+    from sglang.srt.server_args import get_global_server_args
+
+    try:
+        _sa = get_global_server_args()
+    except ValueError:
+        _sa = None
+    if not getattr(_sa, "enable_head_aware_mamba_checkpoint", False):
+        return None
+
+    H, d_v, d_k = cache_params.shape.temporal
+    ckpt_size = getattr(_sa, "head_aware_mamba_ckpt_size", None) or (2 * mamba_size)
+    # Expert A/B override of the global/local tau threshold. w_max=0 forces every
+    # head global -> an exact same-precision dense checkpoint (the fair capacity
+    # baseline vs Route A/B selective storage). Unset keeps the plan default.
+    from sglang.srt.environ import envs
+
+    _forced_wmax = envs.SGLANG_FORCE_HEAD_AWARE_WMAX.get()
+    _pool_kwargs = {} if _forced_wmax is None else {"w_max": int(_forced_wmax)}
+    pool = HeadAwareCheckpointPool(
+        num_slots=ckpt_size,
+        num_layers=len(mamba_layer_ids),
+        num_heads=H,
+        head_v_dim=d_v,
+        head_k_dim=d_k,
+        conv_shapes=list(cache_params.shape.conv),
+        conv_dtype=cache_params.dtype.conv,
+        device=device,
+        route=getattr(_sa, "head_aware_route", "B"),
+        temporal_dtype=cache_params.dtype.temporal,
+        **_pool_kwargs,
+    )
+    logger.info(
+        f"head-aware mamba checkpoint pool: {ckpt_size} slots, route "
+        f"{pool.route}; plan/buffers built lazily on set_plan() after weights load"
     )
     return pool

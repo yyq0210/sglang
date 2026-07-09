@@ -986,9 +986,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     @property
     def int8_ckpt_pool(self):
-        """The int8 checkpoint pool, or None when --enable-int8-mamba-checkpoint is off.
-        When enabled, radix-cached mamba states live HERE (int8), not in the active
-        bf16 pool -> ~2x cached-prefix capacity at fixed memory."""
+        """The radix mamba checkpoint pool, or None when neither
+        --enable-int8-mamba-checkpoint nor --enable-head-aware-mamba-checkpoint is
+        set. When enabled, radix-cached mamba states live HERE (int8-compressed OR
+        head-aware-packed) instead of in the active bf16 pool -> more cached-prefix
+        capacity at fixed memory. Both pools expose the same interface
+        (store_from_active/load_to_active/alloc/free), so the donate/COW/evict hook
+        sites below are checkpoint-pool-agnostic (named for the original int8 pool)."""
         return getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
 
     def _alloc_int8_ckpt_slot(self) -> torch.Tensor:

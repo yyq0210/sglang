@@ -288,6 +288,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
 
+        # Route-B head-aware prefix cache: build the (k,v,g,beta) window capturer so
+        # local heads dropped from the checkpoint can be replayed on a hit. No-op
+        # for every other checkpoint variant / Route A (returns None).
+        self.head_aware_window_capturer = None
+        ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
+        if ckpt_pool is not None and hasattr(ckpt_pool, "maybe_build_window_capturer"):
+            mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
+            self.head_aware_window_capturer = ckpt_pool.maybe_build_window_capturer(
+                mamba_map=self.req_to_token_pool.mamba_map,
+                mamba_num_slots=mamba_cache.temporal.shape[1],
+                dtype=mamba_cache.temporal.dtype,
+            )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
@@ -492,6 +505,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            if self.head_aware_window_capturer is not None and not self.is_draft_worker:
+                # Save the last-W (k,v,g,beta) local-head window for this prefill so
+                # the head-aware checkpoint can donate it if this state is cached.
+                self.head_aware_window_capturer.capture_extend(
+                    layer.layer_id,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    query_start_loc,
+                    cache_indices,
+                )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,

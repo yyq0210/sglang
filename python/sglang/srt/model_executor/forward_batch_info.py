@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -358,6 +358,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
+    # Head-aware GDN checkpoint Route-A re-prefill (M2): set on the SUFFIX forward so the
+    # deferred-COW hook copies reconstructed local-head rows from scratch slots into the
+    # active slots right after load_to_active writes global@P. A
+    # ``HeadAwareReprefillBatch`` (mem_cache.head_aware_reprefill). None on every other path.
+    head_aware_reprefill: Optional[Any] = None
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None

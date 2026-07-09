@@ -861,12 +861,69 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
 
+        # Build the head-aware GDN checkpoint plan now that both the pool
+        # (init_memory_pool) and the model weights (load_model) exist.
+        self.maybe_init_head_aware_mamba_plan()
+
         self.attn_backend = None
         self.decode_attn_backend = None
         self.decode_attn_backend_group = []
         self.decode_cuda_graph_runner = None
         self.graph_mem_usage = 0
         self.prefill_cuda_graph_runner = None
+
+    def maybe_init_head_aware_mamba_plan(self):
+        """Feed the head-aware GDN checkpoint pool its per-layer decay plan.
+
+        The pool (``req_to_token_pool.mamba_ckpt_pool``, a
+        ``HeadAwareCheckpointPool``) defers building its packed byte layout until
+        it has the model's per-layer ``A_log``/``dt_bias`` — static GDN weights
+        that only exist after ``load_model``. Gather them in layer order, stack to
+        ``[num_gdn_layers, num_v_heads]``, and hand them to ``set_plan``. No-op for
+        every other pool variant (int8 / bf16 / None) since only the head-aware
+        pool exposes ``set_plan``.
+        """
+        pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
+        if pool is None or not hasattr(pool, "set_plan"):
+            return
+
+        # Collect GDN linear-attn layers in definition (== layer) order. Each
+        # exposes scalar per-head A_log/dt_bias parameters (qwen3_next.py:182-186).
+        # The mixer (Qwen3GatedDeltaNet) and its RadixLinearAttention child share the
+        # SAME Parameter object (radix_linear_attention.py:75), so it shows up twice
+        # per layer under model.modules() — dedup by storage to keep one per layer.
+        a_logs, dt_biases = [], []
+        seen = set()
+        for module in self.model.modules():
+            a_log = getattr(module, "A_log", None)
+            dt_bias = getattr(module, "dt_bias", None)
+            if a_log is not None and dt_bias is not None:
+                key = a_log.data_ptr()
+                if key in seen:
+                    continue
+                seen.add(key)
+                a_logs.append(a_log.detach().to(torch.float32).cpu().flatten())
+                dt_biases.append(dt_bias.detach().to(torch.float32).cpu().flatten())
+
+        if not a_logs:
+            logger.warning(
+                "head-aware mamba checkpoint enabled but no GDN A_log/dt_bias "
+                "layers found on the model; leaving the plan unset (pool stays idle)."
+            )
+            return
+
+        A_log = torch.stack(a_logs, dim=0)  # [num_gdn_layers, num_v_heads]
+        dt_bias = torch.stack(dt_biases, dim=0)
+        expected_layers = getattr(pool, "num_layers", A_log.shape[0])
+        if A_log.shape[0] != expected_layers:
+            logger.warning(
+                "head-aware mamba plan: collected %d GDN layers but the pool sized "
+                "%d; skipping set_plan to avoid a mismatched byte layout.",
+                A_log.shape[0],
+                expected_layers,
+            )
+            return
+        pool.set_plan(A_log, dt_bias)
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
