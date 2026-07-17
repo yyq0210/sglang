@@ -3,6 +3,7 @@ from typing import Optional, Union
 
 import torch
 
+from sglang.srt.debug import fold_evict, state_ablation
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
@@ -815,9 +816,23 @@ class HybridLinearAttnBackend(AttentionBackend):
         **kwargs,
     ):
         if self._is_full_attn(layer, kwargs.get("layer_id")):
-            return self.full_attn_backend.forward_decode(
-                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
-            )
+            # Phase A2 ablation (experiment-only): hide the prefix KV from this
+            # full-attn layer for the duration of the forward, then restore.
+            with state_ablation.corrupt_full_kv(
+                self.token_to_kv_pool, self.req_to_token_pool, layer.layer_id, forward_batch
+            ):
+                out = self.full_attn_backend.forward_decode(
+                    q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+                )
+            # Phase C2-b fold-to-state eviction (experiment-only): replace the decode
+            # full-attn output with merge(window[sink+recent], state_readout(fold(mid))).
+            # No-op unless FOLD_KV_BUDGET is set; KV pool is read-only (no page free).
+            if fold_evict.enabled():
+                out = fold_evict.apply_fold_decode(
+                    out, q, layer, forward_batch,
+                    self.token_to_kv_pool, self.req_to_token_pool,
+                )
+            return out
         # Linear attention backend
         return self.linear_attn_backend.forward_decode(
             q=q,
@@ -846,9 +861,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         **kwargs,
     ):
         if self._is_full_attn(layer, kwargs.get("layer_id")):
-            return self.full_attn_backend.forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
-            )
+            # Phase A2 ablation (experiment-only): hide the prefix KV from this
+            # full-attn layer for the duration of the forward, then restore.
+            with state_ablation.corrupt_full_kv(
+                self.token_to_kv_pool, self.req_to_token_pool, layer.layer_id, forward_batch
+            ):
+                return self.full_attn_backend.forward_extend(
+                    q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+                )
         # Linear attention backend
         return self.linear_attn_backend.forward_extend(
             q=q,
