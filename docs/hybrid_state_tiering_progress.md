@@ -23,7 +23,7 @@ Hybrid Linear-Attention LLMs.*
 | C0 | fold vs drop 离线可行性 | **GATE-C0** | ✅ 通过(2026-07-17) | **通过** —— LSE 合并数值正确(1e-6);小预算 fold 全面胜 drop(分散召回 cos 0.998 vs 崩塌) |
 | C1 | 门控 fold(真实 GDN gate) | — | ✅ 完成(2026-07-17) | **真实门控救回深层 needle** —— 高记忆 GDN 层(L24)每步保留 r_med=0.998,深度 1720 处累积保留 2.98e-4 = **固定 0.99 的 9580×**;按真实保留折叠把深 needle 的 cos 从 0.171(0.99)拉到 0.357(逼近理想 1.0 的 0.530) |
 | C2 | 融合 kernel + serving | **GATE-C2a** | 🟨 kernel 通过 / serving 负边界(2026-07-17) | **C2-a kernel 通过**(fold-decode GPU == C0 参考 rel<5e-3;微基准 fold 全面胜 dense,1.83~174x)。**C2-b 忠实 serving 是负结果** —— 全注意力层用**固定衰减**折叠中段,深 needle 召回 **1.000→0.000**;印证 C1"固定衰减清零深层",而全注意力层**没有 GDN 那样的逐 token 门控可救回** |
-| D | 统一系统 + 端到端 | — | ⬜ 待做 | — |
+| D | 统一系统 + 端到端(层选择性 fold) | **GATE-D** | 🟨 有界正结果(2026-07-18) | **A1 因果预测器迁移成立** —— 只折**前 9 个检索无关**全注意力层(保留 39/43/47)把 C2-b 的 needle 召回从 **0.000 救回 0.922**(≈dense,残留 ~8% gap);对照 `fold_unsafe`(只折 39/43/47)= **0.000** 崩塌 —— 双向解离。perf(in256/out512<预算)未触发 fold → 与 baseline 同噪声带,容量/时延收益仍由 C2-a 微基准**投影** |
 
 图例:✅ 完成 · 🟨 进行中 · ⬜ 待做。
 
@@ -476,6 +476,89 @@ fold          0.000     0.98       0.000
 **产物:** `test/manual/{fold_decode_kernel,test_fold_decode_gt,bench_fold_decode}.py`(C2-a)、
 `srt/debug/fold_evict.py` + `hybrid_linear_attn_backend.py` decode 钩子 + `test/manual/run_fold_evict_e2e.sh`(C2-b,均 EXPERIMENT-ONLY,env 未设即字节一致)、`e2e_fold_evict_logs/`(结果)。
 
-## Phase D —— 统一系统 + 端到端 ⬜
+## Phase D —— 统一系统 + 端到端(层选择性 fold)🟨 有界正结果(GATE-D)
 
-_完成后追加(配置 · 过程 · 结果)。_
+**问题(RQ4/D3):** C2-b 证明**全折 12 个全注意力层**把深 needle 召回清零(1.000→0.000),因为固定衰减把
+深层内容淹没、而全注意力层没有 GDN 那样的逐 token 门控可救回。但 **A1** 已因果证明:12 个全注意力层里,
+检索**只由最后 3 层 {39,43,47}** 承担,前 9 层 {3,7,11,15,19,23,27,31,35} 与检索无关。**Phase-D 命题:**
+A1 标定的"可降级层"恰好就是 fold 安全的层 —— 只折前 9 层、保留后 3 层精确,应能把召回救回 ≈dense,
+同时仍折掉 9/12 的全注意力 KV。这把 A1 的**因果预测器**从消融机制搬到真实 fold 机制上验证。
+
+### 配置
+
+- 模型 / serving / 探针:与 C2-b 完全一致(Qwen3-Next-80B-A3B-NVFP4,TP=2,mem-frac 0.7,extra_buffer,
+  triton,`--disable-overlap-schedule --disable-cuda-graph`,PORT 31017;needle doc_words=3000、depth=0.5、
+  16×4=64;fold B=1024、sink=4、decay=1.0、φ=elu1)。**唯一变量 = `FOLD_KV_LAYERS`**。
+- **零新代码逻辑:** `srt/debug/fold_evict.py` 早已支持 `FOLD_KV_LAYERS`(`_read_layer_set` / `should_fold_layer`);
+  `needle_longrange.py` 以 `--mode` 作任意 arm 标签;`run_fold_evict_e2e.sh` 早已透传 `FOLD_KV_LAYERS`。
+  本阶段**仅在驱动脚本里加三个 arm**(`fold_safe` / `fold_unsafe` / `perf_fold_safe`),各自默认层集但保持
+  env 可覆盖;其余(启动 flag、needle 旋钮、report)不变。EXPERIMENT-ONLY,env 未设即字节一致。
+- **三个 arm:**
+  - `fold_safe` —— `FOLD_KV_LAYERS=3,7,11,15,19,23,27,31,35`(折 9 个检索无关层,保留 39/43/47 精确)。
+  - `fold_unsafe`(对照)—— `FOLD_KV_LAYERS=39,43,47`(只折 3 个检索层 → 预测崩塌;把 A1 的晚带从消融搬到 fold)。
+  - `perf_fold_safe` —— 同 fold_safe 层集,跑 bench_serving decode 扫描。
+
+### 过程
+
+1. `fold_safe` arm 起独立 server,needle 探针。`[fold_evict]` 钩子在 **{3,7,11,15,19,23,27,31,35}** 干净触发,
+   **不碰 {39,43,47}**(server 日志核对)。
+2. `fold_unsafe` arm 起独立 server,needle 探针。钩子在 **{39,43,47}** 触发。
+3. `report` 汇 4 行表(以 baseline 为参照)。
+4. D2 perf:`perf_baseline` + `perf_fold_safe`,random in=256 / out=512,conc {1,16,64}。
+
+### 结果
+
+```
+=== Stage D1:长上下文直接检索(以 baseline 为参照),每 arm 64 次 ===
+mode                       retr_acc  hit_frac  ans==dense   FOLD_KV_LAYERS
+baseline                     1.000     0.98       1.000      (fold OFF,dense 上界)
+fold(全 12 层,来自 C2-b)   0.000     0.98       0.000      3,7,…,47
+fold_safe                    0.922     0.98       0.922      3,7,11,15,19,23,27,31,35   <- 救回
+fold_unsafe                  0.000     0.98       0.000      39,43,47                   <- 崩塌(对照)
+```
+
+```
+=== Stage D2:decode 扫描 A/B(random in=256/out=512,单位 ms / tok·s⁻¹)===
+conc  arm         TTFT_med  TPOT_med   out_thr  total_thr
+ 1    baseline     106.13     67.39     14.80     20.15
+ 1    fold_safe    105.98     68.09     14.65     19.95
+16    baseline     162.70     72.58    195.70    297.71
+16    fold_safe    164.60     74.18    193.09    293.74
+64    baseline     161.36     90.45    654.06    998.90
+64    fold_safe    162.30     89.70    654.53    999.62
+```
+
+### 判定 —— **GATE-D 有界通过(A1 因果预测器迁移成立)**
+
+- **双向解离,决定性。** 只折 A1 标定的 **9 个检索无关**全注意力层 → 召回从 C2-b 全折的 **0.000 救回
+  0.922**(≈dense);反过来**只折 3 个检索层** {39,43,47} → 召回 **0.000** 崩塌。两个 arm 的 `hit_frac`
+  均 0.98(同缓存命中)⇒ 因果、非相关。这把 A1 的因果预测器从**消融**(A1:遮住晚带→0.0、遮早/中带→1.0)
+  一比一搬到了**真实 fold 机制**上:**能安全 fold 的层 == A1 说检索无关的层**。C2-b 的负结果由此转成
+  Idea 2 在混合模型上的**有界正结果**。
+- **诚实边界:** ① `fold_safe` = 0.922 < dense 1.000,残留 **~8% gap**,略低于 ~0.95 目标 —— 固定/等权衰减
+  fold 即使在"安全"层上也引入了微小扰动,是**有界正结果、非完全无损**(不同于 Idea 1 no-recon 的 ==dense)。
+  ② `fold_unsafe` 精确复刻 A1 晚带的因果地位:检索由后 3 层承载,fold 它们等价于消融它们。
+- **D2 perf = 忠实/投影,非实测容量。** perf 负载 in=256/out=512 ⇒ 最大 seqlen 768 **< 预算 B=1024**,fold
+  的早退分支(`if not any(n > _BUDGET): return out`)使**没有一步真正 fold**(server 日志零 `[fold_evict]`),
+  故 `fold_safe` 三档并发均与 baseline 落在 **~1-2% 噪声带内**(TTFT 106/165/162 vs 106/163/161,TPOT 68/74/90
+  vs 67/73/90,吞吐同量级)。**结论:env-gated 钩子在欠预算快路径上零开销、字节一致;真正的 O(B) decode 时延
+  与 max-batch/容量收益仍由 C2-a 微基准**投影**(fold ~O(B+d·dv) 对 N 恒定 vs dense O(N),1.83~174x),
+  与 C2-b"KV 池只读、容量投影"的决策一致。诚实范围:fold 覆盖 9/12 全注意力层,后 3 层 + 36 个 GDN 层保持
+  精确/原生 ⇒ **部分容量,非全量**。
+
+### 统一系统框架(D1 of the plan)
+
+混合状态分层系统 = **Idea 1**(免重建前缀缓存,作用于 GDN**可降级层**,Phase B 已在真 80B 验证:1.33~1.60x
+容量 / 0.92x TTFT / 精度中性)**+ Idea 2**(选择性 fold,作用于 A1**检索无关**的全注意力子集,recall 0.922)。
+两者由**同一个 A1 因果预测器**统辖:no-recon 安全,因为 GDN 线性态可降级;fold 安全,因为前 9 个全注意力层
+检索无关;而**后 3 个全注意力层 {39,43,47} 是两者共享的"必须保精确"核心**。
+
+### 范围外(诚实)
+
+- Kimi-Linear / KDA fold(逐 K 门控与 fold 相斥,ReplaySSM 0.7~0.9x 回归)。
+- LongBench / GSM8K 全精度矩阵与多预算扫描(计划的宽 D2)—— 给定 C2-b,needle 召回 + 一次 perf 扫描已是决定性
+  信号;需要全矩阵再展开。
+- 带外放页 / 真实容量实测(C2-b 决策 = 投影)。
+
+**产物:** `test/manual/run_fold_evict_e2e.sh`(+3 arm,唯一代码改动)、
+`e2e_fold_evict_logs/`(`fold_evict_needle.json` 四行表 + `perf_*_conc*.log` + `server_*.log`)。
