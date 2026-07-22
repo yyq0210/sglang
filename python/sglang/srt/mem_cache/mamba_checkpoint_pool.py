@@ -442,6 +442,18 @@ class HeadAwarePlan(_StructBase):
     HV: int
     d_v: int
     d_k: int
+    # ---- KDA per-channel extension (all defaulted -> GDN construction unchanged) ----
+    # KDA decay is per (head, d_k-channel), so the keep/drop unit is a single
+    # d_k COLUMN of a head's [d_v, d_k] state (a d_v-vector), not a whole head row.
+    # When ``per_channel`` is set the per-head fields above (w_head/global_idx/...)
+    # are left as GDN-shaped placeholders and these carry the real plan:
+    #   w_chan   : [L, HV, d_k] int64 — 0 = global column (store exact); W>0 = local.
+    #   global_hk: [L, GU_max, 2] int64 — (head, col) of each packed global unit
+    #              (-1 pad). GU_max = max over layers of #global columns.
+    per_channel: bool = False
+    w_chan: Optional[torch.Tensor] = None
+    global_hk: Optional[torch.Tensor] = None
+    GU_max: int = 0
 
     @classmethod
     def build_plan(
@@ -463,6 +475,11 @@ class HeadAwarePlan(_StructBase):
         read from each GDN layer, e.g. Qwen3-Next ``*.A_log`` / ``*.dt_bias``).
         Classify at a slightly NEGATIVE ``a`` (= -a_margin, slower decay) so the
         window covers real per-token a<0 fluctuations (mirrors the offline test).
+
+        KDA dispatch: when ``dt_bias`` is PER-CHANNEL ([L, HV*d_k], i.e. wider than
+        ``A_log`` [L, HV]) the decay is elementwise per (head, d_k-channel), so we
+        build a per-COLUMN plan (``build_plan_per_channel``) instead of the per-head
+        GDN plan. GDN (dt_bias [L, HV], shape-equal) keeps the exact path below.
         """
         from sglang.srt.layers.attention.fla.gdn_head_aware import (
             _next_pow2,
@@ -471,8 +488,28 @@ class HeadAwarePlan(_StructBase):
         )
 
         assert route in ("A", "B"), f"head_aware_route must be A/B, got {route!r}"
-        assert A_log.dim() == 2 and A_log.shape == dt_bias.shape
+        assert A_log.dim() == 2 and dt_bias.dim() == 2 and A_log.shape[0] == dt_bias.shape[0]
         L, HV = A_log.shape
+        if dt_bias.shape[1] != HV:
+            # KDA per-channel: dt_bias is [L, HV*d_k]. Route B window-replay is not
+            # supported per-channel (delta-rule couples columns) -> Route A only.
+            assert dt_bias.shape[1] % HV == 0, (
+                f"KDA dt_bias width {dt_bias.shape[1]} not a multiple of HV={HV}"
+            )
+            K = dt_bias.shape[1] // HV
+            assert K == d_k, f"KDA per-channel expects d_k={d_k} columns, got {K}"
+            assert route == "A", "KDA per-channel head-aware supports Route A only"
+            return cls.build_plan_per_channel(
+                A_log=A_log,
+                dt_bias=dt_bias.reshape(L, HV, K),
+                d_k=d_k,
+                d_v=d_v,
+                eps=eps,
+                w_max=w_max,
+                w_min=w_min,
+                a_margin=a_margin,
+            )
+        assert A_log.shape == dt_bias.shape
         # the plan is a one-time static computation; do it on CPU so it never
         # depends on the caller's device (build_plan tensors are CPU scratch).
         A_log = A_log.detach().cpu().to(torch.float64)
@@ -540,6 +577,82 @@ class HeadAwarePlan(_StructBase):
             d_k=d_k,
         )
 
+    @classmethod
+    def build_plan_per_channel(
+        cls,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        d_k: int,
+        d_v: int,
+        eps: float = 1e-3,
+        w_max: int = 4096,
+        w_min: int = 4,
+        a_margin: float = 0.3,
+    ) -> HeadAwarePlan:
+        """KDA per-(head, d_k-channel) Route-A plan.
+
+        A_log   : [L, HV] per-head scalar. dt_bias : [L, HV, d_k] per-channel.
+        Decay g[l,h,k] = -exp(A_log[l,h]) * softplus(-a_margin + dt_bias[l,h,k]);
+        tau = ln(eps)/g. A COLUMN k of head h's [d_v, d_k] state is:
+          * global (w_chan==0) if tau > w_max (or non-finite) -> store the d_v-vector
+            exact.
+          * local  (w_chan=W>0) if tau <= w_max -> drop it (Route A re-prefills the
+            last W prefix tokens on a hit). W = clamp(next_pow2(tau), w_min, w_max).
+        The packed unit is a global (head, col) pair; ``global_hk`` [L, GU_max, 2]
+        lists them (GU_max = max over layers of #global columns). The per-head
+        fields are GDN-shaped placeholders (unused when ``per_channel``).
+        """
+        from sglang.srt.layers.attention.fla.gdn_head_aware import (
+            _next_pow2,
+            gdn_gate,
+            tau_from_g,
+        )
+
+        L, HV, K = dt_bias.shape
+        assert K == d_k
+        A_log = A_log.detach().cpu().to(torch.float64)
+        dt_bias = dt_bias.detach().cpu().to(torch.float64)
+
+        w_chan = torch.zeros((L, HV, K), dtype=torch.int64)
+        for l in range(L):
+            # g_repr[h,k] with a = -a_margin (broadcast A_log[l] over K columns).
+            a_off = torch.full((HV, K), -a_margin, dtype=torch.float64)
+            g_repr = gdn_gate(a_off, A_log[l][:, None], dt_bias[l])  # [HV, K]
+            tau = tau_from_g(g_repr, eps)  # [HV, K] float64
+            local = torch.isfinite(tau) & (tau <= float(w_max))
+            for h, k in torch.nonzero(local, as_tuple=False).tolist():
+                w_chan[l, h, k] = min(max(_next_pow2(tau[h, k].item()), w_min), w_max)
+
+        is_local = w_chan > 0
+        n_global = (~is_local).sum(dim=(1, 2))  # [L] (global columns per layer)
+        GU_max = int(n_global.max().item()) if L else 0
+        W_max = int(w_chan.max().item()) if bool(is_local.any()) else 0
+
+        global_hk = torch.full((L, max(GU_max, 1), 2), -1, dtype=torch.int64)
+        for l in range(L):
+            gu = torch.nonzero(~is_local[l], as_tuple=False)  # [n_global, 2] (h, k)
+            global_hk[l, : gu.shape[0]] = gu
+
+        placeholder = torch.zeros((L, HV), dtype=torch.int64)
+        return cls(
+            route="A",
+            w_head=placeholder,
+            global_idx=placeholder,
+            local_idx=placeholder,
+            local_w=placeholder,
+            G_max=0,
+            Lwin_max=0,
+            W_max=W_max,
+            HV=HV,
+            d_v=d_v,
+            d_k=d_k,
+            per_channel=True,
+            w_chan=w_chan,
+            global_hk=global_hk,
+            GU_max=GU_max,
+        )
+
 
 class HeadAwareCheckpointStore:
     """Packed head-aware store for cached multi-layer GDN states.
@@ -572,12 +685,29 @@ class HeadAwareCheckpointStore:
         self.state_dtype = state_dtype
         L = plan.global_idx.shape[0]
         self.L = L
+        self.per_channel = plan.per_channel
         # move static plan tensors onto the store's device once
         self.global_idx = plan.global_idx.to(device)
         self.local_idx = plan.local_idx.to(device)
         self.local_w = plan.local_w.to(device)
         # valid (non-pad) global rows per layer, for scatter on load
         self._g_valid = self.global_idx >= 0  # [L, G_max]
+
+        if self.per_channel:
+            # KDA: the packed unit is a global (head, d_k-col) pair -> a d_v-vector.
+            self.global_hk = plan.global_hk.to(device)  # [L, GU_max, 2]
+            self.w_chan = plan.w_chan.to(device)  # [L, HV, d_k]
+            self._u_valid = self.global_hk[..., 0] >= 0  # [L, GU_max]
+            self.state_buf_pc = torch.empty(
+                L,
+                num_slots,
+                max(plan.GU_max, 1),
+                plan.d_v,
+                dtype=state_dtype,
+                device=device,
+            )
+            self.route_b = False
+            return
 
         self.state_buf = torch.empty(
             L,
@@ -656,6 +786,9 @@ class HeadAwareCheckpointStore:
             states = states.unsqueeze(1)
         N = slots.numel()
         assert states.shape[1] == N, f"{states.shape[1]} states for {N} slots"
+        if self.per_channel:
+            self._store_per_channel(slots, states)
+            return
         for l in range(self.L):
             gi = self.global_idx[l].clamp(min=0)  # [G_max]; pad rows -> head 0
             # states[l]: [N, HV, d_v, d_k] -> gather global rows -> [N, G_max, d_v, d_k]
@@ -666,6 +799,22 @@ class HeadAwareCheckpointStore:
                 self._store_windows_packed(slots, windows)
             else:
                 self._store_windows(slots, windows)
+
+    def _store_per_channel(self, slots: torch.Tensor, states: torch.Tensor) -> None:
+        """Pack GLOBAL (head, d_k-col) units' d_v-vectors. states: [L, N, HV, d_v, d_k].
+
+        For each layer, gather ``states[l][:, h, :, k]`` over the layer's global
+        (h, k) units into ``state_buf_pc[l, slots]`` = [N, GU_max, d_v]. Pad units
+        (h==-1) are clamped to (0,0) and their packed rows are never read on load
+        (masked by ``_u_valid``), so the junk they gather is harmless.
+        """
+        for l in range(self.L):
+            h_idx = self.global_hk[l, :, 0].clamp(min=0)  # [GU_max]
+            k_idx = self.global_hk[l, :, 1].clamp(min=0)  # [GU_max]
+            # states[l][:, h_idx, :, k_idx]: advanced indices on non-adjacent axes
+            # 1 and 3 -> broadcast dim moves to front -> [GU_max, N, d_v].
+            picked = states[l][:, h_idx, :, k_idx]  # [GU_max, N, d_v]
+            self.state_buf_pc[l, slots] = picked.permute(1, 0, 2).to(self.state_dtype)
 
     def _store_windows_packed(self, slots: torch.Tensor, windows: dict) -> None:
         """Copy already-packed local-head windows straight into the win_* buffers.
@@ -707,6 +856,8 @@ class HeadAwareCheckpointStore:
         N = slots.numel()
         HV, d_v, d_k = self.plan.HV, self.plan.d_v, self.plan.d_k
         out = torch.zeros(self.L, N, HV, d_v, d_k, dtype=out_dtype, device=self.device)
+        if self.per_channel:
+            return self._load_per_channel(slots, out, out_dtype)
         for l in range(self.L):
             valid = self._g_valid[l]
             if valid.any():
@@ -717,6 +868,29 @@ class HeadAwareCheckpointStore:
             return out, None
         # Route A: local heads stay zero; report the mask for scheduler re-prefill
         return out, (self.plan.w_head.to(self.device) > 0)
+
+    def _load_per_channel(
+        self, slots: torch.Tensor, out: torch.Tensor, out_dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Scatter packed GLOBAL (head, d_k-col) d_v-vectors back into the dense
+        state; LOCAL columns stay zero and are reported per-(head, col) so the
+        Route-A re-prefill masked copy-back rebuilds only those columns.
+
+        ``state_buf_pc[l, slots]`` is [N, GU_max, d_v]; only the ``_u_valid`` units
+        (real (h, k) pairs, not pad) are scattered to ``out[l][:, h, :, k]``.
+        Returns (states, local_needs_reprefill) with the mask shaped [L, HV, d_k].
+        """
+        for l in range(self.L):
+            valid = self._u_valid[l]  # [GU_max]
+            if not valid.any():
+                continue
+            h_idx = self.global_hk[l, valid, 0]  # real head ids [nvalid]
+            k_idx = self.global_hk[l, valid, 1]  # real d_k-col ids [nvalid]
+            src = self.state_buf_pc[l, slots][:, valid].to(out_dtype)  # [N, nvalid, d_v]
+            # scatter to out[l][:, h_idx, :, k_idx] (adv idx axes 1,3 -> front dim)
+            out[l][:, h_idx, :, k_idx] = src.permute(1, 0, 2)
+        # Route A: local (dropped) columns reported as a [L, HV, d_k] bool mask.
+        return out, (self.w_chan > 0)
 
     def _replay_windows(
         self, slots: torch.Tensor, out: torch.Tensor, l2norm_k: bool
@@ -758,6 +932,8 @@ class HeadAwareCheckpointStore:
     # ---- byte accounting (capacity) ----
 
     def mem_usage_bytes(self) -> int:
+        if self.per_channel:
+            return self.state_buf_pc.numel() * self.state_buf_pc.element_size()
         total = self.state_buf.numel() * self.state_buf.element_size()
         if self.route_b:
             for t in (self.win_k, self.win_v, self.win_g, self.win_beta):
@@ -1076,7 +1252,10 @@ class HeadAwareCheckpointPool:
 
         ``scratch_slots`` / ``active_slots`` are aligned [N] index tensors (one
         scratch slot per Route-A hit). ``mask[l]`` is a [HV] bool selecting the
-        local heads for layer ``l``.
+        local heads for layer ``l`` (GDN) — or, for KDA per-channel, a [HV, d_k]
+        bool selecting the local (head, d_k-column) pairs, so only those columns of
+        each head's [d_v, d_k] state are copied and global columns keep the exact
+        checkpoint@P.
         """
         mask = active_mamba_pool.mamba_head_reprefill_mask
         if mask is None:
@@ -1085,6 +1264,19 @@ class HeadAwareCheckpointPool:
         temporal = active_mamba_pool.mamba_cache.temporal  # [L, slots, HV, d_v, d_k]
         scratch_slots = self.store._as_slots(scratch_slots).to(temporal.device)
         active_slots = self.store._as_slots(active_slots).to(temporal.device)
+        if self.store.per_channel:
+            # KDA: mask[l] is [HV, d_k] — copy only the local (head, col) d_v-vectors
+            # (a single column of the [d_v, d_k] state), leaving global columns exact.
+            for l in range(self.store.L):
+                hk = mask[l].nonzero(as_tuple=False)  # [n_local, 2] (head, col)
+                if hk.shape[0] == 0:
+                    continue
+                h_idx, k_idx = hk[:, 0], hk[:, 1]
+                # adv-index axes 0,1,3 (slice on the d_v axis 2) -> [N, n_local, d_v]
+                src = temporal[l][scratch_slots.unsqueeze(1), h_idx, :, k_idx]
+                temporal[l][active_slots.unsqueeze(1), h_idx, :, k_idx] = src
+            active_mamba_pool.mamba_head_reprefill_mask = None
+            return
         for l in range(self.store.L):
             heads = mask[l].nonzero(as_tuple=False).flatten()  # local head ids
             if heads.numel() == 0:

@@ -25,6 +25,8 @@ Hybrid Linear-Attention LLMs.*
 | C2 | 融合 kernel + serving | **GATE-C2a** | 🟨 kernel 通过 / serving 负边界(2026-07-17) | **C2-a kernel 通过**(fold-decode GPU == C0 参考 rel<5e-3;微基准 fold 全面胜 dense,1.83~174x)。**C2-b 忠实 serving 是负结果** —— 全注意力层用**固定衰减**折叠中段,深 needle 召回 **1.000→0.000**;印证 C1"固定衰减清零深层",而全注意力层**没有 GDN 那样的逐 token 门控可救回** |
 | D | 统一系统 + 端到端(层选择性 fold) | **GATE-D** | 🟨 有界正结果(2026-07-18) | **A1 因果预测器迁移成立** —— 只折**前 9 个检索无关**全注意力层(保留 39/43/47)把 C2-b 的 needle 召回从 **0.000 救回 0.922**(≈dense,残留 ~8% gap);对照 `fold_unsafe`(只折 39/43/47)= **0.000** 崩塌 —— 双向解离。perf(in256/out512<预算)未触发 fold → 与 baseline 同噪声带,容量/时延收益仍由 C2-a 微基准**投影** |
 | G | 因果驱逐优先级(value vs LRU mamba 检查点驱逐) | **GATE-G** | ✅ 通过(2026-07-22) | **value 策略实测胜出(时延/吞吐)** —— A2 证 mamba 检查点是**可降级层**(驱逐召回中性:miss 精确重算前缀),故可把 radix 驱逐 victim 从**纯 recency(LRU)**换成**按复用频率(value)**;checkpoint pool 饱和 + Zipf 前缀倾斜下,两个独立工作点均 **hit-rate +10~12pt、TTFT -15~17%、吞吐 +17%**;env 未设时与 LRU 字节一致 |
+| H | 纯 GDN 正对照(打破准确率天花板) | **GATE-H1** | 🟥 诚实 NULL(2026-07-22) | **H1 未通过 —— 片上致盲无法造出纯 GDN 区。** 致盲全部 12 个全注意力层的 prefix KV 后,`gdn_only` 召回在**所有深度(含紧邻 d=0.95)均为 0.000**,`hybrid` 恒为 1.000。**关键 nuance:** 失败模式是**模型坍缩**(输出退化为重复:`State State State`/`( ( (`/`1111111111`),而非干净的"GDN 取不到 needle" —— 说明全注意力 prefix KV 对**基本连贯性**(非仅检索)也是承载的,模型被联合训练成依赖全注意力做上下文整合。⇒ 片上致盲是**被污染的**纯 GDN 模拟,度量无法区分"GDN 缺 needle"与"模型坏了"。按计划在 H1 处**以诚实 null 停止**,不进 H2/H3;正对照需**真纯 GDN 模型**(fallback b)或改探针(短程/聚合任务) |
+| K | KDA 逐通道 head-aware(实现 + 离线门) | **GATE-K1** | ✅ 通过(2026-07-22) | **逐通道 head-aware 机制就位、离线正确。** KDA 衰减逐 K 通道(90.6% head 混合,逐 head 不迁移)→ keep/drop 单元 = 全局 `(head, d_k 列)` = 一个 `d_v` 向量。按 `dt_bias` 宽度自动分派(GDN 逐 head 字节一致);GATE-K1 合成 + **真实 Kimi-Linear-48B 权重**双过:global 列位精确 / local 清零 / mask 正确 / 真机 **35.31x** 容量(99.8% 列 local@w512)/ GDN 非回归。**serving A/B(GATE-K2)未跑** —— 阻塞于 KimiLinear 缺 `extra_buffer` 白名单 + KDA extra_buffer 0.63 bug;可落地路径 = Idea4 value 驱逐 + Idea1 no-recon(`no_buffer` 全提示复用) |
 
 图例:✅ 完成 · 🟨 进行中 · ⬜ 待做。
 
@@ -628,3 +630,291 @@ Zipf 倾斜下 value 保留热前缀 checkpoint ⇒ 更多 `#cached-token` ⇒ �
 **产物:** `environ.py`(+1 env)、`mamba_radix_cache.py`(hit_count 计数 + `_evict_mamba_value`)、
 `test/manual/test_mamba_evict_policy.py`(GATE-G1)、`bench_gdn_prefix_hitrate.sh`(+env 透传);
 bench 日志 `gdn_prefix_hitrate_logs/evict_ab{3,4}/`(未入库)。
+
+---
+
+## Phase H —— 纯 GDN 正对照:打破准确率天花板 ⬜(代码就位待跑)
+
+### 动机(为什么)
+
+到目前为止,所有 state-tier 结果(Idea 1 no-recon、Idea 2 fold、Idea 4 value 驱逐 / Phase G)
+在混合 Qwen3-Next 上**只能被展示为准确率中性**:dense == no-recon == fold-safe == value-evict ==
+**1.000** needle 召回。这就是**准确率天花板问题** —— 度量被钉在 1.0,因为 12 个全注意力层承载长程检索,
+GDN 态是一个真正**可降级**的层,碰它永远不动精度。我们反复展示了因果预测器的**负臂**("GDN 态可降级
+→ 策略中性"),却从未展示**正臂**("当态确实承载因果信息时,尊重它的策略会**提升**精度")。这一 gap 在
+memory 里被标记了 3 次:*"精度可判别的版本仍缺纯 GDN 正对照"*。
+
+**Phase H 关闭它。** 在**同一个模型**上造出一个 GDN 态是所检索事实**唯一**载体的区域 —— 用已提交的
+`state_ablation.corrupt_full_kv` 挂钩(`ABLATE_FULL_KV=zero`,挂在
+`hybrid_linear_attn_backend.py:821,866`)**致盲全注意力层**对 prefix 的读取。在这个纯 GDN 区里天花板消失,于是:
+(1) 把事实移出 GDN 的递归视野会**降低**精度 = GDN 承载的正对照;(2) 一个重建 GDN 态的 recon 策略会
+**找回** no-recon 丢掉的精度 = **用户要的"提升精度的策略"**。复用已提交的 needle 探针 + recon 旋钮,
+无需下载新模型。
+
+### 决定性设计选择 —— 扫 needle 的**距 query 距离**,而非文档长度
+
+关键风险是 Qwen3-Next 的 GDN 在**任何**深度都做不到精确检索(线性注意力弱于精确召回,模型学会把检索路由到
+全注意力)。我们通过扫 needle **距 query 的距离**来降低这个风险:`needle_longrange.py --depth` 把 needle
+插在文档的 `depth` 比例处,问题出现在**整篇文档之后**。于是 `depth→1.0` = needle 紧邻 query(在 GDN 递归
+窗内,几乎必然保留),`depth→0.0` = needle 很远(已从 GDN 态衰减掉)。全注意力致盲后,GDN-only 召回应画出
+一条 **近高→远低** 的曲线,而混合 baseline 在所有深度都 ~1.0。这个对比把**近上下文记忆因果定位到 GDN、
+远上下文定位到全注意力** —— 一个近乎必然存在的正对照(GDN 总保留紧邻的 token),而不是赌一个魔法文档长度。
+
+### 复用(不重写)
+
+- `python/sglang/srt/debug/state_ablation.py` —— `ABLATE_FULL_KV=zero|noise`(逐 forward snapshot→
+  破坏→恢复,非持久)+ `ABLATE_FULL_KV_LAYERS`(层白名单);`corrupt_full_kv` 已挂在
+  `hybrid_linear_attn_backend.py:821,866`。`ABLATE_LINEAR_STATE=zero` + `corrupt_linear_state_`(GDN
+  ssm_state 清零)此前**函数存在但未接入 kernel 路径** —— Phase H2 补上(见下)。
+- `test/manual/needle_longrange.py` —— 每组唯一 5 位码的直接检索探针(`--depth`/`--doc-words`/`--groups`/
+  `--k-per-group`,温度 0),输出 `retrieval_acc` + `cache_hit_frac`。
+- `test/manual/run_state_ablation_2x2.sh` —— arms `baseline|ablate_linear|ablate_full_kv|ablate_both`,
+  每 arm 一份 server,`report` 打印 2×2 —— **就是 H2 驱动,现成可用**(一旦线性挂钩接上)。
+- `test/manual/bench_gdn_prefix_hitrate.sh` —— 底层启动驱动(headaware_a route-A 旗标,PORT 31007,
+  TP2);继承 shell 环境 → 导出 `ABLATE_*` 即可组合。H3 需要它逐 forward 跑致盲挂钩 → **新增
+  `DISABLE_CUDA_GRAPH=1` env 旋钮**(与 `DISABLE_OVERLAP` 平行,未设时字节一致)。
+
+### H2 一行接线(仅实验用,`ABLATE_LINEAR_STATE=off` 时字节一致)
+
+在 GDN kernel 读 `ssm_states` 的入口(`linear/gdn_backend.py` 的 `forward_decode` 与 `forward_extend`,
+`ssm_states` + `mamba_cache_indices` 都在手处)加一行 env 门控调用:
+
+```python
+if state_ablation.linear_state_enabled():
+    state_ablation.corrupt_linear_state_(ssm_states, cache_indices)
+```
+
+镜像已提交的 `corrupt_full_kv` 接线风格;未设 env 时是 no-op。`decode` 路径插在 `cache_indices` 解析后、
+conv/SSM kernel 读态前;`extend` 路径插在 `ssm_states = mamba_cache_params.temporal` 后、把它当 chunk
+初始态读入前。
+
+### Stage H1 —— 关键探针:GDN-only 检索到底能不能行?(GATE-H1)
+
+**无新后端代码。** 新驱动 `test/manual/run_gdn_only_depth_sweep.sh`:
+- 中等文档(`NEEDLE_DOC_WORDS≈800`,小到 GDN 视野有望覆盖),`NEEDLE_GROUPS≈12`,`NEEDLE_K≈4`,
+  `DISABLE_OVERLAP=1`,`--disable-cuda-graph`(致盲挂钩逐 forward 必须跑)。
+- 两次 server 启动(dense 权重,head-aware **关**,纯消融):
+  - arm `hybrid`   : `ABLATE_FULL_KV=off`  → 期望每个深度 acc ~1.0(全注意力承载)。
+  - arm `gdn_only` : `ABLATE_FULL_KV=zero` → GDN-only 曲线。
+- 每 arm 循环 `NEEDLE_DEPTH ∈ {0.95,0.85,0.7,0.5,0.3,0.1}`,每深度一次探针(tag `${arm}_d${depth}`),
+  追加到一份 JSON;内嵌 python reporter 打印两 arm 的 acc-vs-depth 表并**自动建议操作深度 d\***。
+
+**GATE-H1(成败关键):**
+- **成功:** `gdn_only` acc **近 query 高、随距离衰减**(如 depth≥0.85 时 ≳0.5,depth≤0.3 时 →~0),
+  同时 `hybrid` 保持 ~1.0 → GDN 承载区存在;取 `gdn_only` 落在判别中带(~0.4–0.8)的**操作深度 d\***,
+  进入 H2/H3。
+- **诚实回退:** 若 `gdn_only` 在**每个**深度都 ~0(连紧邻也是),则 Qwen3-Next 的 GDN 做不到精确检索 →
+  记录为发现并**停止**(不伪造正结果);回退选项 =(a)换成 GDN 能承载的任务(短程召回/聚合,超出本计划
+  默认范围),或(b)取一个真正的纯 GDN 模型。
+
+### Stage H2 —— 显式因果 knockout 2×2(GATE-H2,加固)
+
+确认近上下文记忆**具体就是** GDN 态(而非"存在别处")。用 H1 的操作点跑现成
+`run_state_ablation_2x2.sh`(`NEEDLE_DEPTH=d*`,`NEEDLE_DOC_WORDS≈800`),arms
+`baseline|ablate_full_kv|ablate_both|ablate_linear`。
+
+**GATE-H2(双解离):** `baseline`~1.0;`ablate_full_kv`≈`gdn_only(d*)`(中带,>0);`ablate_both`→~0
+(在致盲全注意力之上再清 GDN 态 = 摧毁最后的载体 = **正对照**:此处 GDN 态承载);`ablate_linear`≈1.0
+(全注意力完好 → 中性 = 已知负臂)。这就是完成的正+负因果表。
+
+### Stage H3 —— 提升精度的策略(GATE-H3,交付物)
+
+在 GDN-only 区证明 **recon 策略找回 no-recon 丢掉的精度**。新驱动
+`test/manual/run_gdn_only_recon_sweep.sh` = recon 扫描的薄覆盖层:
+- 所有 arm 导出 `ABLATE_FULL_KV=zero`(GDN-only 覆盖)于 `NEEDLE_DEPTH=d*`,doc≈800,headaware_a route-A
+  开(GDN 检查点在 prime→question 缓存边界被丢弃/重建)。
+- arms:`norecon`(`NORECON=1`,GDN 态保持丢弃)vs `recon_full`(route-A full-W_max recon,重建 GDN 态);
+  可选 `seam=16`(有损部分 recon,`RUN_SEAM=1`)。
+- **先做组合冒烟:** norecon arm 先跑,确认 `ABLATE_FULL_KV=zero` + route-A recon 能跑完且缓存命中
+  (探针打印 `cache_hit_frac`>0)。full_kv 的 snapshot/restore 逐 forward、与 GDN 检查点路径正交。
+
+**GATE-H3(成功):** 在 d\*,`recon_full` acc **> `norecon` acc** 且差距明显(recon 向 hybrid 的 1.0 回收,
+norecon 停在丢弃态地板)。这是 **提升精度的策略** —— recon 的首个非中性正结果,正是此前因缺纯 GDN 区而
+无法检验的"recon 在纯 GDN 上有价值"。**诚实回退:** 若纯 GDN 区里 `recon_full`≈`norecon`,则 route-A recon
+没有忠实重建 needle 承载态 —— 带数字记录 null(仍是真发现:recon 即使离开天花板也中性),不夸大。
+
+### 诚实边界
+
+- 片上全注意力致盲是**模拟**纯 GDN 区,不是原生纯 GDN 模型 —— 明说。真纯 GDN 检查点是更强外部对照,但在
+  本机 cu12.9 天花板(base `753aa89a83`)上有下载/兼容风险 → 仅 H1 失败时回退。
+- H1 真正可证伪 —— 若 GDN 任何深度都检索不到,计划在 H1 处以诚实 null **停止**,不伪造正结果。
+- 一切仅实验用、env 门控,`ABLATE_*` / `NORECON` 未设时字节一致。不用 cuda graph(数据相关的消融),
+  `--disable-overlap-schedule` 保留。这里的度量是**准确率**(retrieval_acc),非时延。
+
+### 状态 / 产物
+
+- **代码就位(2026-07-22):** H2 挂钩(`linear/gdn_backend.py` decode+extend 各一行 env 门控)、H1 驱动
+  `test/manual/run_gdn_only_depth_sweep.sh`、H3 驱动 `test/manual/run_gdn_only_recon_sweep.sh`、
+  `bench_gdn_prefix_hitrate.sh` 新增 `DISABLE_CUDA_GRAPH` 旋钮。
+- **结果落地:** `state_ablation_logs/gdn_only_depth_sweep.json`、`.../gdn_only_recon_sweep.json`、
+  `.../state_ablation_2x2.json`(未入库);数字回填本文 + memory `phase-h-pure-gdn-positive-control.md`。
+
+### GATE-H1 结果 —— 🟥 诚实 NULL(2026-07-22,真 80B TP2)
+
+配置:Qwen3-Next-80B-A3B-NVFP4,TP2,extra_buffer,triton,`--disable-overlap-schedule`,
+`--disable-cuda-graph`,doc 800 词、12 组 × 4 问 = 48 试验/深度、温度 0。两 arm 各起一份 server。
+
+| depth | 距 query | hybrid acc | gdn_only acc | hit_frac |
+|-------|----------|-----------|--------------|----------|
+| 0.95 | near | 1.000 | **0.000** | 1.00 |
+| 0.85 | near | 1.000 | **0.000** | 1.00 |
+| 0.70 | near | 1.000 | **0.000** | 1.00 |
+| 0.50 | mid  | 1.000 | **0.000** | 1.00 |
+| 0.30 | far  | 1.000 | **0.000** | 1.00 |
+| 0.10 | far  | 1.000 | **0.000** | 1.00 |
+
+**判定:GATE-H1 未通过。** `gdn_only` 在**所有深度(含紧邻 d=0.95,needle 距 query 仅 ~80 token)均为 0**,
+没有 near→far 衰减曲线可言,取不到判别中带的 d\*。缓存 100% 命中(探针路径正常);`hybrid` 恒 1.000
+(消融确实生效:致盲把 1.0 打到 0.0,与 A2 一致)。
+
+**关键 nuance(比纯 null 更有信息量):** 逐条看 `gdn_only` 输出,失败模式是**模型坍缩**而非干净的
+"GDN 缺 needle" —— 输出退化为重复串(`State State State…`、`( ( (…`、`1111111111`、`What What…`),
+而同一探针/缓存路径下 `hybrid` 输出干净的正确码(`10271`)。这说明**致盲全部 12 个全注意力层的 prefix KV,
+移除的远不止 needle,而是模型做上下文整合、维持基本连贯所依赖的全部长程注意力** —— Qwen3-Next 被联合训练成
+依赖全注意力做通用上下文处理,不只是检索。
+
+**结论:** 片上全注意力致盲**不是**一个干净的纯 GDN 模拟 —— 度量无法区分"GDN 态里没有 needle"与
+"模型整体坏掉"这两种解释,正对照被污染。按计划在 H1 处**以诚实 null 停止**,**不**进入 H2/H3
+(二者以 GATE-H1 成功为前提)。这本身是一个真发现:**在混合模型上,全注意力 prefix KV 对基本连贯性
+(非仅检索)是因果承载的**,因此不能靠清零全注意力来"关掉"它。要拿到精度可判别的正对照,需要:
+(a)**真正的纯 GDN 模型**(如 GatedDeltaNet 检查点;本机 cu12.9 base `753aa89a83` 有下载/兼容风险),或
+(b)改用 GDN 本就能承载的任务(短程召回 / 聚合类,而非精确 5 位码检索)—— 两者都超出本计划默认范围,
+待与用户确认后再定。
+
+**产物:** `state_ablation_logs/gdn_only_depth_sweep.json` + 各 arm `server_gdnonly_*.log`、
+`needle_gdnonly_*.log`(未入库)。代码(H2 挂钩 + H1/H3 驱动 + `DISABLE_CUDA_GRAPH` 旋钮)保持
+**未提交**(GATE-H1 未通过 → 按提交规范暂不入库)。
+
+---
+
+## 探索 —— KDA 逐通道衰减画像:local/global 是双峰吗?(离线,零风险)
+
+### 动机 —— 把 head-aware 从 GDN 迁到 KDA 的前提验证
+
+GDN head-aware prefix cache 依赖一个**干净的逐 head local/global 划分**(GDN 衰减 = 逐 head 标量
+`g_h = -exp(A_log_h)·softplus(a+dt_bias_h)`,tau_h 逐 head 可分)。**KDA 的衰减是逐 K 通道**(elementwise):
+`g[t,h,k] = -exp(A_log[h])·softplus(a[t,h,k] + dt_bias[h,k])`,其中 `A_log`=[H] 逐 head 标量、
+`dt_bias`=[H·K] 逐 (head,通道)、`a`=`f_b_proj(f_a_proj(x))`=[T,H,K] 输入相关。所以要回答用户的
+问题"**KDA 不好区分 local/global,有什么办法**",先要弄清:(head,通道) 的衰减是**双峰分离**(存在硬通道
+阈值)还是**连续**的?
+
+Kimi-Linear-48B-A3B-Instruct:27 层,20 KDA + 7 全注意力 {4,8,12,16,20,24,27};H=32,K=head_dim=128
+⇒ 20·32·128 = 81920 个通道。度量:保留率 `alpha=exp(g)`、记忆视野 `tau=ln(eps)/g`(token);
+Sarle 双峰系数 `BC=(skew²+1)/kurtosis`,`BC>0.555` 判为双峰。
+
+### 工具(新增,未入库,纯离线 CPU/单卡)
+
+`test/manual/profile_kda_decay.py` —— GDN `profile_gdn_decay.py` 的 KDA 逐通道版。两种模式:
+- `weights`:从 safetensors 读 `A_log`[H] + `dt_bias`[H·K],在**常数 a 括号**(a=0 / a=1 / a=2)下算
+  静态骨架分布。a=0 曾被当作"最少遗忘上界"。
+- `empirical`:HF transformers 真跑 48B,钩住全部 20 个 KDA 层的 `f_b_proj` 抓真实逐 token `a`,逐通道对
+  token 求均值 → 真实输入下的 (head,通道) 衰减。
+
+**跑通 48B 的 6 个兼容补丁**(cu12.9 + transformers 5.6.0 + 本地 fla 源
+`/home/…/flash-linear-attention`,全部在 `profile_kda_decay.py` 内):①`OutputRecorder` no-op shim;
+②载后强制所有 config `_attn_implementation="eager"`(modeling 硬塞 flash_attention_2 会在 `s_aux=None.to()`
+崩;全注意力是 MLA,eager 原生支持);③`fused_kda_gate` 签名适配器(modeling 用旧 API `(g,A_log,head_dim,
+g_bias=dt_bias)`,fla 源是 `(g,A_log,dt_bias=,lower_bound=,…)`)+ 把 g `[…,H·K]→[…,H,K]` reshape(长序列走
+`chunk_kda` 断言 4-D g);④`device_map={"":0}` 单卡(48B bf16 ~94GB 进一张 143GB H20,免跨卡 gemm);
+⑤`use_cache=False`(免 Kimi 混合缓存 `get_mask_sizes` int-vs-tensor 崩);⑥`PYTHONPATH` 指向本地 fla 源
+(pip wheel 是无 `fla.ops` 的命名空间桩)。
+
+### 结果 —— 3 个诚实发现(以 12 条多域长 prompt × 558 tok = 6696 tokens 的**可信** empirical 跑为准)
+
+> 说明:先跑 5 条短 prompt(≤37 tok,走非 chunk 容忍 3-D g 的路径,轻微偏差);随后**修正 g reshape**
+> 后用 12 条 diverse 长 prompt 重跑(正确 chunk-mode 门控),分位数坐实。3 个发现两跑一致,量级在长跑更长。
+
+1. **逐通道衰减是 UNIMODAL/连续,不是双峰。** `BC(log10 tau)=0.422`(<0.555;单个宽驼峰,峰在
+   log10 tau≈1.4 即 tau≈25,右侧长尾)。→ 对"是不是双峰"的回答是**否 —— 连续,无硬通道阈值**。
+   (`BC(alpha)`/`BC(g)` 读数 >0.555 只因 alpha 被界在 [0,1] 两端堆积;记忆视野的正确度量 log10 tau 是单峰。)
+2. **KDA 记忆整体偏 SHORT,但真实输入下尾巴比静态骨架重。** tau 分位:p25=11、p50=45、p75=260、p95=2010、
+   max≈1.16M。local 覆盖率:55.8%@w64、66.6%@128、74.8%@256、82.2%@512、88.9%@1024、95.1%@2048、
+   97.9%@4096。**"a=0 = tau 上界"的假设是错的** —— 真实 `a` 会取**负值** ⇒ 更少遗忘 ⇒ 尾巴比任何
+   常数 a≥0 骨架都长(极端尾到 ~1M token)。
+3. **逐 head 可分性在真实输入下坍塌 —— 关键修正。** 静态权重骨架曾显示逐 head local-fraction 呈 U 形
+   (57~70% 近纯 head);**empirical 在判别窗 w=45(整体 50% local)下只有 9.4% head 是纯的、90.6% 是
+   MIXED**,逐 head local-fraction 直方图近**扁平**(非 U 形)。原因:静态骨架 head 内只变 `dt_bias`(逐 head
+   `A_log` 标量主导 → head 聚成两簇);真实输入相关 `a` 给 head 内加了大的逐通道离散度 ⇒ 几乎每个 head 都
+   同时握**快 + 慢**两类通道。**所以 KDA 的 local/global 是真·逐通道,而非逐 head —— GDN 式逐 head 分层不迁移。**
+
+### 结论 / 策略(回答"KDA 不好区分 local/global,有什么办法")
+
+- **不要**按硬通道阈值切 local/global(衰减连续,BC=0.31~0.42),**也不要**逐 head keep/drop(真实输入下
+  90.6% head 混合)。
+- 正确设计 = **逐通道 SOFT 窗口,窗口 = 每个通道自己的 tau**(多数很小:p50=22~45、p95=314~2010)。一个
+  w≈512–2048 的窗口覆盖 82~95% 通道,只有 ~5% 长尾(tau>2048)需要更长保留或精确保存。比权重骨架的
+  故事更干净:一条连续的逐通道视野,而非二元分层。
+
+### 诚实边界 / 后续
+
+- empirical 仅 12 条 prompt(6696 tok),定性发现(通道单峰、head 混合)稳健,分位数可再加长/加多样 prompt
+  坐实。工具 + 发现均**未入库**(探索性)。
+- **重要迁移前提:唯一可用的真·逐通道 KDA 模型 Kimi-Linear 本身是混合架构(7 全注意力层)** —— 与
+  Qwen3-Next 同样存在**准确率天花板**:混合模型上全注意力承载长程检索,重建 KDA 态在精度上多半**中性**
+  (no-recon == recon == dense)。因此逐通道 soft 窗口 recon 的精度收益需要**纯 KDA 正对照**才能显形
+  (与 Idea 1 / Phase H 同一 gap;Phase H 片上致盲模拟已因模型坍缩失败)。可直接落地且诚实的 KDA 实验是:
+  (i) **Idea 4 value 驱逐**(`SGLANG_MAMBA_EVICT_POLICY=value`,衰减无关、模型无关,预期复现 Phase G 的
+  命中率/TTFT/吞吐实测正结果),(ii) **Idea 1 no-recon**(丢弃 KDA 态 + 前缀复用,衰减无关,预期与 GDN
+  同样容量正、精度中性)。逐通道 recon 是大改动且在混合 Kimi 上大概率撞天花板,列为后续可选。
+
+---
+
+## Phase K —— KDA 逐通道 head-aware:实现与离线门(GATE-K1)✅ 通过(2026-07-22)
+
+### 动机 —— 把 head-aware 前缀缓存从 GDN(逐 head)迁到 KDA(逐通道)
+
+GDN 的衰减是**逐 head 标量**,keep/drop 单元 = 一个 head 的整块态,head-aware 缓存天然逐 head。KDA 的衰减是
+**逐 K 通道 elementwise**(见上"KDA 逐通道衰减画像":`BC(log10 tau)=0.42` 单峰、90.6% head 混合),
+逐 head keep/drop **不迁移**。所以 KDA 的 head-aware 必须**逐通道**:keep/drop 单元 = 一个全局
+`(head, d_k 列)` 对 = 一个 `d_v` 向量。KDA 态 `S_h` 形状 `[d_v, d_k]`,逐通道衰减作用在 `d_k` **列**上;
+`KimiLinearStateShape.temporal = (num_heads, head_dim, head_dim)`(末轴 = `d_k`,`d_v==d_k==128`)。
+
+### 实现(实验专用、按张量形状分派、GDN 字节一致)
+
+全部改动集中在 `mamba_checkpoint_pool.py`(+`model_runner.py` 3 行注释),**靠 dt_bias 的宽度自动分派**,
+未走 KDA 时 GDN 路径完全不变:
+
+- `HeadAwarePlan`(msgspec.Struct)新增 5 个**默认字段**:`per_channel=False` / `w_chan` / `global_hk` /
+  `GU_max`。GDN 构造时全部取默认 → 与旧路径字节一致。
+- `build_plan` 分派:放宽形状断言到 `A_log.dim()==2 且 dt_bias.dim()==2 且行数相等`;取 `L,HV=A_log.shape`,
+  若 `dt_bias.shape[1] != HV` ⇒ KDA(`K = dt_bias.shape[1]//HV`,断言 `K==d_k` 且 `route=="A"`)
+  → `build_plan_per_channel`;否则(`==HV`)走原 GDN 逐 head 路径。**KDA 的 `A_log` 仍是逐 head `[HV]`,
+  只有 `dt_bias` 是逐通道 `[HV*d_k]`**(`kimi_linear.py`:`projection_size=head_dim*num_heads`,head-major
+  展平),`model_runner.py` 的 `.flatten()` 直接产出宽 dt_bias,无需 KDA 专用采集。
+- `build_plan_per_channel`:逐层用 `gdn_gate(a_off[HV,K], A_log[:,None], dt3)` 算逐列 `tau`,
+  `local = isfinite(tau) & (tau <= w_max)`;`w_chan[L,HV,K]` = 逐列窗口;`global_hk[L,GU_max,2]` 枚举
+  `~local` 的 `(h,k)` 对(填充 -1);GDN 字段留占位。
+- `HeadAwareCheckpointStore`:per-channel 分支分配 `state_buf_pc[L, num_slots, GU_max, d_v]`(**只存 global 列的
+  `d_v` 向量**,这就是容量来源),`_u_valid = global_hk[...,0] >= 0`。
+  - `_store_per_channel`:`picked = states[l][:, h_idx, :, k_idx]`(高级索引轴 1,3 → `[GU_max, N, d_v]`)存入。
+  - `_load_per_channel`:逐层把有效 global 列 scatter 回 `out[l][:, h_idx, :, k_idx]`,返回
+    `(out, w_chan>0)` 作 local 掩码 `[L,HV,d_k]`。
+  - `copy_local_rows_from_scratch` per-channel 分支:从 re-prefill scratch 态按 `mask[l].nonzero()` 的
+    `(head,列)` 逐列 masked copy-back 到 active 态(Route-A seam),GDN 逐 head 路径不动。
+
+### GATE-K1 —— 离线正确性(纯 CPU/GPU-free)✅ 通过
+
+`test/manual/test_kda_head_aware_prefix.py`(新增,零 GPU),合成 + 真实 Kimi 权重两路都过:
+
+| 检查 | 合成 `L=3 HV=8` | 真实 Kimi-Linear-48B `20 KDA 层 HV=32` |
+| --- | --- | --- |
+| (1) 分类 local iff `tau<=w_max` | 1941/3072 local(exact) | 81779/81920 local、141 global(exact) |
+| (2) round-trip:global 列位精确 / local 清零 / mask==`w_chan>0` | max\|dS\|=0、local=0、mask✓ | 同,全 0 / mask✓ |
+| (3) 容量 bytes/slot vs dense | 0.59M vs 1.57M = **2.67x** | 1.19M vs 41.9M = **35.31x** |
+| (4) GDN 非回归(dt_bias 塌成 `[L,HV]` → `per_channel=False`) | 仍精确 round-trip | 同 |
+| (5) 逐通道 masked copy-back(真实 `copy_local_rows_from_scratch`) | OK | OK |
+
+真实权重 **35.31x** 容量对应 **99.8% 列 local**(w=512)—— 与"KDA 记忆偏 SHORT"的 empirical 画像一致
+(静态权重在 `a=-a_margin` 下 tau 更短,几乎全 local)。逐层 re-prefill 态重装配相对误差 3.9e-4(信息性;
+Route-A 重建精度在真机上量)。**GDN 路径全程字节一致**(route A 3.37x、route B 1.21x 未变)。
+
+### 诚实边界 / 后续(GATE-K2 待定)
+
+- **离线机制已完备,serving A/B(GATE-K2)未跑且有真实模型级阻塞。** head-aware 池要复用共享前缀的 mamba 态,
+  依赖 `extra_buffer` 缓存策略(`no_buffer` 只在整序列叶子快照 → 前缀复用 ~0)。**KimiLinear 不在
+  `_support_mamba_cache_extra_buffer` 白名单**,且 KDA `extra_buffer` 有已知 0.63 精度 bug
+  (`kda_backend.py forward_extend` 只返回 `core_attn_out`,无中间 SSM `h` track/restore)。
+- 因此逐通道 head-aware 的**容量/命中率收益要落到 serving,需先解 extra_buffer**;而在混合 Kimi 上其
+  **精度预期仍中性**(天花板)。可直接落地且诚实的 KDA serving 实验仍是 **Idea 4 value 驱逐**(衰减/模型无关)
+  与 **Idea 1 no-recon**(`no_buffer` 全提示复用可绕开 extra_buffer bug,`no_buffer` KDA GSM8K=0.895 正常)。
+- 代码 **env/形状门控**,未走 KDA(GDN)时字节一致;GATE-K1 通过后可入库,GATE-K2 待模型阻塞决策。

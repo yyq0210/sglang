@@ -892,6 +892,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # The mixer (Qwen3GatedDeltaNet) and its RadixLinearAttention child share the
         # SAME Parameter object (radix_linear_attention.py:75), so it shows up twice
         # per layer under model.modules() — dedup by storage to keep one per layer.
+        # KDA (kimi_linear.py) reuses this path: its A_log is still per-head [HV] but
+        # dt_bias is PER-CHANNEL [HV*d_k] (flattened head-major); build_plan detects
+        # the wider dt_bias and builds a per-column plan (GDN stays per-head).
         a_logs, dt_biases = [], []
         seen = set()
         for module in self.model.modules():
