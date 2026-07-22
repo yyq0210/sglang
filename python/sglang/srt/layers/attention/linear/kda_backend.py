@@ -187,13 +187,34 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        # mamba_cache.conv is [..., kernel-1, dim] while conv_states_shape expects
+        # the window length (kernel-1) at shape[-1], hence the transpose. This is
+        # the KDA (K-1, channel) layout, transposed vs GDN's (channel, K-1).
+        self.conv_states_shape = (
+            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0]
+            .transpose(-1, -2)
+            .shape
+        )
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
 
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        if self.forward_metadata.has_mamba_track_mask:
+            self.forward_metadata.mamba_track_mask_indices = (
+                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+            )
+            self.forward_metadata.conv_states_mask_indices = (
+                forward_batch.mamba_track_indices[
+                    self.forward_metadata.mamba_track_mask_indices
+                ]
+            )
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
         mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         a: torch.Tensor,
         b: torch.Tensor,
@@ -229,7 +250,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "KDA packed decode requires one token per sequence (T=1): "
                 f"got {qkv.shape[0]} tokens for {cache_indices.shape[0]} requests."
             )
-            return self.kernel_dispatcher.packed_decode(
+            core_attn_out = self.kernel_dispatcher.packed_decode(
                 mixed_qkv=qkv,
                 a=a,
                 b=b,
@@ -241,13 +262,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
             )
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices
+            )
+            return core_attn_out
 
         q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
-        return self.kernel_dispatcher.decode(
+        core_attn_out = self.kernel_dispatcher.decode(
             q=q,
             k=k,
             v=v,
@@ -259,6 +284,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
         )
+
+        self._track_mamba_state_decode(
+            forward_batch, conv_states, ssm_states, cache_indices
+        )
+
+        return core_attn_out
 
     def forward_extend(
         self,
@@ -278,6 +309,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
         ssm_states = mamba_cache_params.temporal
 
         has_initial_state = forward_batch.extend_prefix_lens > 0
+
+        # Snapshot the last conv window of the aligned prefix into the persistent
+        # track slots for prefix caching. KDA conv[0] is already (K-1, channel), so
+        # the pre-transpose mixed_qkv[track_conv_indices] rows match directly (no
+        # transpose, unlike GDN whose conv is (channel, K-1)).
+        if self.forward_metadata.has_mamba_track_mask:
+            mamba_cache_params.conv[0][
+                self.forward_metadata.conv_states_mask_indices
+            ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
         splits = [layer.q_dim, layer.k_dim, layer.v_dim]
         q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
@@ -328,6 +368,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
+        track_ssm = self.forward_metadata.has_mamba_track_mask
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,
             k=k,
@@ -340,6 +381,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=getattr(layer, "lower_bound", None),
+            return_intermediate_states=track_ssm,
         )
+        if track_ssm:
+            core_attn_out, h = core_attn_out
+            self._track_mamba_state_extend(
+                forward_batch, h, ssm_states, self.forward_metadata
+            )
 
         return core_attn_out

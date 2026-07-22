@@ -4457,6 +4457,7 @@ class ServerArgs:
 
     def _support_mamba_cache_extra_buffer(self, model_arch: str):
         if model_arch in [
+            "KimiLinearForCausalLM",
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3NextForCausalLM",
