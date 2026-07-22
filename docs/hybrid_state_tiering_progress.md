@@ -24,6 +24,7 @@ Hybrid Linear-Attention LLMs.*
 | C1 | 门控 fold(真实 GDN gate) | — | ✅ 完成(2026-07-17) | **真实门控救回深层 needle** —— 高记忆 GDN 层(L24)每步保留 r_med=0.998,深度 1720 处累积保留 2.98e-4 = **固定 0.99 的 9580×**;按真实保留折叠把深 needle 的 cos 从 0.171(0.99)拉到 0.357(逼近理想 1.0 的 0.530) |
 | C2 | 融合 kernel + serving | **GATE-C2a** | 🟨 kernel 通过 / serving 负边界(2026-07-17) | **C2-a kernel 通过**(fold-decode GPU == C0 参考 rel<5e-3;微基准 fold 全面胜 dense,1.83~174x)。**C2-b 忠实 serving 是负结果** —— 全注意力层用**固定衰减**折叠中段,深 needle 召回 **1.000→0.000**;印证 C1"固定衰减清零深层",而全注意力层**没有 GDN 那样的逐 token 门控可救回** |
 | D | 统一系统 + 端到端(层选择性 fold) | **GATE-D** | 🟨 有界正结果(2026-07-18) | **A1 因果预测器迁移成立** —— 只折**前 9 个检索无关**全注意力层(保留 39/43/47)把 C2-b 的 needle 召回从 **0.000 救回 0.922**(≈dense,残留 ~8% gap);对照 `fold_unsafe`(只折 39/43/47)= **0.000** 崩塌 —— 双向解离。perf(in256/out512<预算)未触发 fold → 与 baseline 同噪声带,容量/时延收益仍由 C2-a 微基准**投影** |
+| G | 因果驱逐优先级(value vs LRU mamba 检查点驱逐) | **GATE-G** | ✅ 通过(2026-07-22) | **value 策略实测胜出(时延/吞吐)** —— A2 证 mamba 检查点是**可降级层**(驱逐召回中性:miss 精确重算前缀),故可把 radix 驱逐 victim 从**纯 recency(LRU)**换成**按复用频率(value)**;checkpoint pool 饱和 + Zipf 前缀倾斜下,两个独立工作点均 **hit-rate +10~12pt、TTFT -15~17%、吞吐 +17%**;env 未设时与 LRU 字节一致 |
 
 图例:✅ 完成 · 🟨 进行中 · ⬜ 待做。
 
@@ -562,3 +563,68 @@ conc  arm         TTFT_med  TPOT_med   out_thr  total_thr
 
 **产物:** `test/manual/run_fold_evict_e2e.sh`(+3 arm,唯一代码改动)、
 `e2e_fold_evict_logs/`(`fold_evict_needle.json` 四行表 + `perf_*_conc*.log` + `server_*.log`)。
+
+---
+
+## Phase G —— Idea 4:因果驱逐优先级(value vs LRU)✅ 通过(GATE-G)
+
+### 动机 —— 从"可降级层"到"可重排驱逐"
+
+Phase A2 证明:**mamba(GDN)线性态是可降级层**(清零线性态,混合模型召回仍 1.0)。把这个结论从"计算"迁移
+到"缓存管理":radix 里缓存的 **mamba checkpoint(前缀共享的 GDN 状态 S)也是可降级/可重建层** —— 驱逐一个
+checkpoint 是**召回中性**的(下次命中 miss ⇒ 精确重算该前缀,答案不变)。既然驱逐谁都不影响正确性,就有自由度把
+victim 选择从**纯 recency(LRU)**换成**按价值(复用频率)**,在偏斜(Zipf)前缀流行度下保留最热前缀 ⇒
+换取更高的 cached-prefix 命中率,**不换任何精度**。
+
+这是与 Idea 1/2 正交的第三条线:Idea 1/2 动的是**读取/折叠**,Phase G 动的是**驱逐策略**;都被同一个
+"线性态可降级"的 A2 因果结论授权。
+
+### 实现(实验专用、env 门控、未设时字节一致)
+
+- 新 env `SGLANG_MAMBA_EVICT_POLICY`(`environ.py`,`EnvStr("lru")`):`"lru"` = 原纯 recency 路径(**字节一致**);
+  `"value"` = 按价值驱逐。
+- `mamba_radix_cache.py`:
+  - `TreeNode.hit_count`(原本未用)在 `match_prefix` 命中且节点持有 mamba_value 时 +1 —— 复用频率计数。
+  - `evict_mamba` 在 `policy=="value"` 时分派到新 `_evict_mamba_value`:对当前**未锁定**的 mamba 节点建
+    `(hit_count, last_access_time, id)` 小根堆,**先驱逐价值最低**者(复用最少,recency 破平);复用既有的
+    内部节点 tombstone / `_evict_leaf_node` 机制;对已被联动释放的陈旧堆项用 `in_list()`/锁重检跳过。
+    `"lru"` 路径原样保留。
+- 驱动 `bench_gdn_prefix_hitrate.sh` 增 `MAMBA_EVICT_POLICY` 透传(所有 arm 统一,公平 A/B)。
+
+### GATE-G1 —— 离线门控(纯 python,无 GPU)✅ 通过
+
+`test/manual/test_mamba_evict_policy.py`,直接跑真 `TreeNode`+`LRUList`+`evict_mamba`(仅桩掉 GPU 物理释放):
+①LRU 按纯 recency 驱逐最老(即使最热);②value 按最低频率驱逐;③**recency 与 frequency 反相关**(热前缀早
+缓存)时 value 保留 155 复用质量 vs LRU 仅 55;④锁定 checkpoint 永不被 value 驱逐;⑤value 正确 tombstone
+低价值内部节点。全部 PASS。
+
+### GATE-G2 —— 真 80B 端到端 A/B(命中率/TTFT)✅ 通过
+
+真 Qwen3-Next-80B-A3B-NVFP4,TP=2,headaware_a(route A,extra_buffer,NORECON=1,triton,`--disable-overlap-schedule`)。
+关键是让 **mamba checkpoint pool 饱和且不饥饿**:pool 槽位须 > 并发(锁定集),又 < 活跃不同前缀数(才会驱逐)。
+诚实踩坑记录:pool=16 + conc32 ⇒ `Can not alloc int8 mamba checkpoint slot` 断言(16 槽全被在飞请求锁定,
+驱逐无可释放)⇒ **pool 必须 > 并发锁定集**。最终工作点:conc=8、pool=40~48、256/200 个不同 Zipf(α=1.2~1.3)
+前缀、sys=1024、`generated-shared-prefix`。两个独立工作点(evict_ab3/ab4),输入 token 总量逐 arm 完全一致:
+
+| 工作点 | 策略 | token 命中率 | TTFT 均值 | TTFT p90 | E2E 均值 | 吞吐(tok/s) |
+|--------|------|-------------|-----------|----------|----------|-------------|
+| A(ng256/ckpt48/α1.3) | LRU   | 0.5035 | 430.4 | 599.9 | 538.2 | 18120 |
+| A                     | value | **0.6080** | **358.3** | **474.0** | **458.0** | **21286** |
+| B(ng200/ckpt40/α1.2) | LRU   | 0.4315 | 436.3 | 594.9 | 548.8 | 17742 |
+| B                     | value | **0.5485** | **367.5** | **501.4** | **468.2** | **20790** |
+
+两点一致:**命中率 +10~12pt(相对 +21~27%)、TTFT 均值 −15~17%、p90 −16~21%、吞吐 +17%**。机制正如预测:
+Zipf 倾斜下 value 保留热前缀 checkpoint ⇒ 更多 `#cached-token` ⇒ 更少重算前缀 ⇒ 更低 TTFT / 更高吞吐。
+
+### 判定 —— **GATE-G 通过(实测时延/吞吐正结果)**
+
+- **这是 Idea 1/2 之外少见的 *实测*(非投影)正结果**:因为动的是纯软件驱逐策略,不涉及 kernel/容量投影,可直接
+  端到端量化。
+- **诚实边界:** ① 收益是**命中率/TTFT/吞吐**,**不是精度** —— 混合模型上驱逐召回中性(这正是 A2 授权的前提);
+  精度可判别的版本仍缺**纯 GDN 正对照**(与 Idea 1 同一 gap)。② 收益只在 **pool 饱和 + 前缀流行度偏斜**时出现;
+  pool 不饱和(如早期 pool=160 峰值仅用 ~22 槽)则 `evict_mamba` 基本不触发,两策略等价。③ 工作点须满足
+  `pool > 并发锁定集` 否则饥饿崩溃(已记录)。
+
+**产物:** `environ.py`(+1 env)、`mamba_radix_cache.py`(hit_count 计数 + `_evict_mamba_value`)、
+`test/manual/test_mamba_evict_policy.py`(GATE-G1)、`bench_gdn_prefix_hitrate.sh`(+env 透传);
+bench 日志 `gdn_prefix_hitrate_logs/evict_ab{3,4}/`(未入库)。

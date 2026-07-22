@@ -702,6 +702,16 @@ class Envs:
     # Local heads with tau > seam are only PARTIALLY reconstructed -> accuracy is an
     # empirical question (gsm8k judges it).
     SGLANG_HEAD_AWARE_SEAM_WINDOW = EnvInt(None)
+    # Mamba (GDN) radix checkpoint eviction policy. Expert A/B knob (experiment-only).
+    # The GDN checkpoint is a degradable/reconstructable tier (Phase A2 causal ablation:
+    # zeroing the GDN state leaves recall intact on hybrid models), so reordering its
+    # eviction is accuracy-neutral -- a hit re-uses the cached state, a miss re-prefills
+    # the prefix exactly. That licenses replacing plain recency (LRU) with a value-aware
+    # order that keeps the most-reused checkpoints, trading nothing in accuracy for a
+    # higher cached-prefix hit-rate under skewed (Zipf) prefix popularity.
+    #   "lru"   -> default, evict least-recently-used (byte-identical to prior behavior)
+    #   "value" -> evict lowest-value first, value = (hit_count, last_access_time)
+    SGLANG_MAMBA_EVICT_POLICY = EnvStr("lru")
 
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
