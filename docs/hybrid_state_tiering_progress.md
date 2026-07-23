@@ -26,7 +26,7 @@ Hybrid Linear-Attention LLMs.*
 | D | 统一系统 + 端到端(层选择性 fold) | **GATE-D** | 🟨 有界正结果(2026-07-18) | **A1 因果预测器迁移成立** —— 只折**前 9 个检索无关**全注意力层(保留 39/43/47)把 C2-b 的 needle 召回从 **0.000 救回 0.922**(≈dense,残留 ~8% gap);对照 `fold_unsafe`(只折 39/43/47)= **0.000** 崩塌 —— 双向解离。perf(in256/out512<预算)未触发 fold → 与 baseline 同噪声带,容量/时延收益仍由 C2-a 微基准**投影** |
 | G | 因果驱逐优先级(value vs LRU mamba 检查点驱逐) | **GATE-G** | ✅ 通过(2026-07-22) | **value 策略实测胜出(时延/吞吐)** —— A2 证 mamba 检查点是**可降级层**(驱逐召回中性:miss 精确重算前缀),故可把 radix 驱逐 victim 从**纯 recency(LRU)**换成**按复用频率(value)**;checkpoint pool 饱和 + Zipf 前缀倾斜下,两个独立工作点均 **hit-rate +10~12pt、TTFT -15~17%、吞吐 +17%**;env 未设时与 LRU 字节一致 |
 | H | 纯 GDN 正对照(打破准确率天花板) | **GATE-H1** | 🟥 诚实 NULL(2026-07-22) | **H1 未通过 —— 片上致盲无法造出纯 GDN 区。** 致盲全部 12 个全注意力层的 prefix KV 后,`gdn_only` 召回在**所有深度(含紧邻 d=0.95)均为 0.000**,`hybrid` 恒为 1.000。**关键 nuance:** 失败模式是**模型坍缩**(输出退化为重复:`State State State`/`( ( (`/`1111111111`),而非干净的"GDN 取不到 needle" —— 说明全注意力 prefix KV 对**基本连贯性**(非仅检索)也是承载的,模型被联合训练成依赖全注意力做上下文整合。⇒ 片上致盲是**被污染的**纯 GDN 模拟,度量无法区分"GDN 缺 needle"与"模型坏了"。按计划在 H1 处**以诚实 null 停止**,不进 H2/H3;正对照需**真纯 GDN 模型**(fallback b)或改探针(短程/聚合任务) |
-| K | KDA 逐通道 head-aware(实现 + 离线门) | **GATE-K1** | ✅ 通过(2026-07-22) | **逐通道 head-aware 机制就位、离线正确。** KDA 衰减逐 K 通道(90.6% head 混合,逐 head 不迁移)→ keep/drop 单元 = 全局 `(head, d_k 列)` = 一个 `d_v` 向量。按 `dt_bias` 宽度自动分派(GDN 逐 head 字节一致);GATE-K1 合成 + **真实 Kimi-Linear-48B 权重**双过:global 列位精确 / local 清零 / mask 正确 / 真机 **35.31x** 容量(99.8% 列 local@w512)/ GDN 非回归。**serving A/B(GATE-K2)未跑** —— 阻塞于 KimiLinear 缺 `extra_buffer` 白名单 + KDA extra_buffer 0.63 bug;可落地路径 = Idea4 value 驱逐 + Idea1 no-recon(`no_buffer` 全提示复用) |
+| K | KDA 逐通道 head-aware(实现 + 离线门 + serving A/B) | **GATE-K1/K2a/K2b** ✅ / **K2c** ⚠️ | ✅ 通过(2026-07-22/23) | **逐通道 head-aware 机制就位,离线+serving 均已验证。** KDA 衰减逐 K 通道(90.6% head 混合,逐 head 不迁移)→ keep/drop 单元 = 全局 `(head, d_k 列)` = 一个 `d_v` 向量。按 `dt_bias` 宽度自动分派(GDN 逐 head 字节一致);K1 合成 + 真实 Kimi 权重双过(35.31x@w512)。**serving A/B 由回移 PR #31474 解锁(提交 dceaaafd88)**:**K2a✅** extra_buffer GSM8K 1319q **0.892==no_buffer 0.900**(修复前 0.63);**K2b✅** 真机建池 **2048x 容量**、needle norecon 1.000==dense 精度中性;**K2c⚠️** value 命中率 **51.2% vs lru 36.8%(+14.4pt)**、输入 token 一致(召回中性),但 TTFT 反向(326.8 vs 299.0ms,因 recon-ON;干净 TTFT 收益需 NORECON) |
 
 图例:✅ 完成 · 🟨 进行中 · ⬜ 待做。
 
@@ -859,7 +859,7 @@ g_bias=dt_bias)`,fla 源是 `(g,A_log,dt_bias=,lower_bound=,…)`)+ 把 g `[…,
 
 ---
 
-## Phase K —— KDA 逐通道 head-aware:实现与离线门(GATE-K1)✅ 通过(2026-07-22)
+## Phase K —— KDA 逐通道 head-aware:实现 + 离线门(GATE-K1)+ serving A/B(GATE-K2a/K2b ✅,K2c ⚠️)(2026-07-22/23)
 
 ### 动机 —— 把 head-aware 前缀缓存从 GDN(逐 head)迁到 KDA(逐通道)
 
@@ -908,13 +908,31 @@ GDN 的衰减是**逐 head 标量**,keep/drop 单元 = 一个 head 的整块态,
 (静态权重在 `a=-a_margin` 下 tau 更短,几乎全 local)。逐层 re-prefill 态重装配相对误差 3.9e-4(信息性;
 Route-A 重建精度在真机上量)。**GDN 路径全程字节一致**(route A 3.37x、route B 1.21x 未变)。
 
-### 诚实边界 / 后续(GATE-K2 待定)
+### GATE-K2 —— serving A/B ✅ 解锁并跑通(2026-07-23,回移 PR #31474)
 
-- **离线机制已完备,serving A/B(GATE-K2)未跑且有真实模型级阻塞。** head-aware 池要复用共享前缀的 mamba 态,
-  依赖 `extra_buffer` 缓存策略(`no_buffer` 只在整序列叶子快照 → 前缀复用 ~0)。**KimiLinear 不在
-  `_support_mamba_cache_extra_buffer` 白名单**,且 KDA `extra_buffer` 有已知 0.63 精度 bug
-  (`kda_backend.py forward_extend` 只返回 `core_attn_out`,无中间 SSM `h` track/restore)。
-- 因此逐通道 head-aware 的**容量/命中率收益要落到 serving,需先解 extra_buffer**;而在混合 Kimi 上其
-  **精度预期仍中性**(天花板)。可直接落地且诚实的 KDA serving 实验仍是 **Idea 4 value 驱逐**(衰减/模型无关)
-  与 **Idea 1 no-recon**(`no_buffer` 全提示复用可绕开 extra_buffer bug,`no_buffer` KDA GSM8K=0.895 正常)。
-- 代码 **env/形状门控**,未走 KDA(GDN)时字节一致;GATE-K1 通过后可入库,GATE-K2 待模型阻塞决策。
+**阻塞解除:** 把上游 **PR #31474**(KDA extra_buffer 的 mamba-track 修复)中与合并相关的部分回移进本分支,
+提交 `dceaaafd88`(5 文件 +69/-5,作者 yuyanqi,无 trailer)。做法 = 把 GDN 的 mamba-track 路径**镜像**进 KDA:
+`fla/kda.py` `chunk_kda(output_intermediate_states=)` 返回逐 chunk 的 SSM `h`;`kernels/kda_triton.py extend(return_intermediate_states=)`
+透传;`kda_cutedsl.py` 抛 NotImplementedError(tracked 批走 Triton);`kda_backend.py` 镜像 `gdn_backend`
+(`__init__` 设 `conv_states_shape`,KDA conv 布局 `(K-1,channel)` **不转置**;`init_forward_metadata` 填
+`mamba_track_mask_indices`/`conv_states_mask_indices`;`forward_decode` 调 `_track_mamba_state_decode`;
+`forward_extend` 快照 conv 窗 + `_track_mamba_state_extend`);`server_args.py:4458` 把 `KimiLinearForCausalLM`
+加入 `_support_mamba_cache_extra_buffer` 白名单(仍 gated triton)。**除非在 KimiLinear 显式选 extra_buffer,否则字节一致。**
+
+| 门 | 内容 | 结果 |
+| --- | --- | --- |
+| **K2a**(硬门/成败) | 真机 Kimi-48B TP2 GSM8K 5-shot 1319q,extra_buffer vs no_buffer | ✅ **extra_buffer 0.892 == no_buffer 0.900**(修复前 0.63 → 恢复;== PR 的 0.895)。共享 5-shot 前缀确被缓存(`#cached-token` 640/1280/1920 递增) |
+| **K2b**(Idea1 容量+精度中性) | extra_buffer 下起逐通道 head-aware Route-A 池;真机能力 + needle 探针 | ✅ 真机权重无崩溃建池(验证离线 K1 机制上线),**2048x 容量**(bytes/slot=10240 vs dense 20971520;真机默认 w_max=4096,窗更大 → 可丢 local 列更多,离线为 35x@w512);needle **norecon 1.000 == dense 1.000** 精度中性(Kimi 7 全注意力层承载长程记忆,丢 KDA local 列在混合架构上免费) |
+| **K2c**(Idea4 value vs lru 驱逐) | ckpt=48 << 256 Zipf(α=1.1) 前缀、conc8、recon **ON**、warm+measure 两遍 | ⚠️ **混合结果**:value 命中率 **51.2%**(cached 2,474,048 / new 2,362,375)vs lru **36.8%**(1,777,280 / 3,059,143)= **+14.4pt**,输入 token **完全一致**(2,417,031)→ **召回中性、机制在 KDA 上确认**;**但 TTFT 反向**(value 326.8ms vs lru 299.0ms)——因 K2c 走 recon-ON,每多一个命中都要付 Route-A 逐通道重建,抵消了少 prefill 的收益。Phase G 的干净 TTFT 收益用的是 **NORECON**(命中免费) |
+
+真实权重容量与 K1 一致(2048x 是 w_max=4096 下的更大值,K1 用 w=512 得 35.31x)。**GDN 路径全程字节一致。**
+
+### 诚实边界
+
+- 离线机制 + serving 路径现在**都为真**。K2a 正确性已恢复(0.63→0.892);K2b 容量巨大(2048x)且在混合架构上
+  精度中性——但中性是**混合天花板**(逐通道 RECON 的精度收益仍需一个我们缺失的纯 KDA 正对照,与
+  [[phase-h-pure-gdn-positive-control]] 同一空白)。
+- K2c:value 驱逐把 KDA 命中率抬 +14pt(召回中性)符合设计,但 **TTFT 收益需 NORECON**(recon-ON 会侵蚀它)——
+  如实报告,不夸大 KDA 的 TTFT 收益;干净复现 Phase G 需要重跑 NORECON 版 K2c。
+- 代码 **env/形状门控**,未走 KDA(GDN)时及未在 KimiLinear 选 extra_buffer 时字节一致。
+- 驱动脚本:`bench_kda_extra_buffer_gsm8k_k2a.sh` / `bench_kda_headaware_k2b.sh` / `bench_kda_evict_k2c.sh`(均 untracked,日志入 `gdn_prefix_hitrate_logs/` 不提交)。
