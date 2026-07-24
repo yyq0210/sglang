@@ -2115,6 +2115,27 @@ def _validate_parsed_gsp_args(
             "--gsp-group-distribution=zipf; remove --gsp-zipf-alpha "
             "or set --gsp-group-distribution=zipf"
         )
+    lpc = getattr(args, "gsp_len_pop_corr", None)
+    if lpc is not None:
+        if not (-1.0 <= lpc <= 1.0):
+            parser.error(
+                "--gsp-len-pop-corr must be in [-1, 1] "
+                f"(got {lpc})"
+            )
+        if distribution != "zipf":
+            parser.error(
+                "--gsp-len-pop-corr is only meaningful with "
+                "--gsp-group-distribution=zipf (a skewed popularity "
+                "distribution); it has no effect under uniform popularity"
+            )
+        range_ratio = getattr(args, "gsp_range_ratio", None)
+        if range_ratio is not None and range_ratio >= 1.0:
+            parser.error(
+                "--gsp-len-pop-corr requires --gsp-range-ratio < 1 so that "
+                "shared-prefix lengths vary across groups; with "
+                "range_ratio >= 1 all prefixes are equal length and the "
+                "correlation is undefined"
+            )
 
 
 class LoRAPathAction(argparse.Action):
@@ -2600,6 +2621,22 @@ def cli_main():
             "p(rank) = (1/rank**alpha) / sum_k(1/k**alpha) and rank starting "
             "at 1. Must be a finite float strictly greater than 0; larger "
             "values concentrate requests on lower-ranked (hotter) groups."
+        ),
+    )
+    group.add_argument(
+        "--gsp-len-pop-corr",
+        type=float,
+        default=None,
+        help=(
+            "Target Pearson correlation in [-1, 1] between a prefix group's "
+            "popularity (zipf rank; group 0 hottest) and its shared-prefix "
+            "length. Only meaningful with --gsp-group-distribution=zipf and "
+            "--gsp-range-ratio < 1 (needs length variance across groups). "
+            "rho>0 makes longer prefixes hotter (favours cost-aware GDSF "
+            "eviction), rho<0 makes shorter prefixes hotter, rho=0 leaves "
+            "length independent of popularity. Lengths are permuted across "
+            "groups with an isolated RNG so the prompt pool stays "
+            "byte-identical to the unset path for the same seed."
         ),
     )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")

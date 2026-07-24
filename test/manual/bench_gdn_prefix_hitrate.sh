@@ -78,6 +78,13 @@ COMMON=(
 if [ "${DISABLE_OVERLAP:-0}" = "1" ]; then
   COMMON+=(--disable-overlap-schedule)
 fi
+# Phase H overlay: the ABLATE_FULL_KV blinding hook is a per-forward Python context
+# manager whose loc gather does a device->host copy CUDA-graph capture forbids, and
+# graph replay would skip the Python entirely. DISABLE_CUDA_GRAPH=1 routes decode
+# through eager so the ablation runs every step. Unset -> byte-identical (graph on).
+if [ "${DISABLE_CUDA_GRAPH:-0}" = "1" ]; then
+  COMMON+=(--disable-cuda-graph)
+fi
 EXTRA=()
 # Per-mode env (e.g. the head-aware tau-threshold override for the dense baseline).
 declare -a MODE_ENV=()

@@ -23,6 +23,8 @@ from sglang.benchmark.datasets.common import DatasetRow, gen_mm_prompt
 from sglang.benchmark.datasets.custom import sample_custom_requests
 from sglang.benchmark.datasets.generated_shared_prefix import (
     GeneratedSharedPrefixDataset,
+    _normal_quantile,
+    _reorder_lengths_by_popularity,
     _zipf_group_probs,
     get_gen_prefix_cache_path,
     sample_generated_shared_prefix_requests,
@@ -629,6 +631,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         output_len=2,
         fast_prepare=True,
         global_seed=None,
+        len_pop_corr=None,
     ):
         # GSP's own `seed` kwarg only feeds the cache filename; reproducibility
         # of compute_random_lens / gen_prompt comes from seeding the module
@@ -651,6 +654,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             ordered=ordered,
             group_distribution=mode,
             zipf_alpha=alpha,
+            len_pop_corr=len_pop_corr,
         )
 
     @staticmethod
@@ -957,6 +961,167 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertEqual(self._row_fields(rows_a), self._row_fields(rows_b))
 
     # ------------------------------------------------------------------
+    # Length-popularity correlation (Path B: tunable rho for GDSF sweep)
+    # ------------------------------------------------------------------
+
+    def test_normal_quantile_matches_known_probit_values(self):
+        # Acklam's probit approximation must land on textbook quantiles across
+        # the lo / mid / hi branches. Reference values from the standard normal
+        # inverse CDF; the approximation's max abs error is ~1.15e-9.
+        p = np.array([0.01, 0.025, 0.1, 0.5, 0.9, 0.975, 0.99])
+        expected = np.array(
+            [
+                -2.326347874,
+                -1.959963985,
+                -1.281551566,
+                0.0,
+                1.281551566,
+                1.959963985,
+                2.326347874,
+            ]
+        )
+        np.testing.assert_allclose(_normal_quantile(p), expected, atol=1e-6)
+        # Symmetry: quantile(p) == -quantile(1-p).
+        np.testing.assert_allclose(
+            _normal_quantile(p), -_normal_quantile(1.0 - p), atol=1e-9
+        )
+
+    def test_reorder_lengths_is_a_permutation(self):
+        # The reorder must be a pure permutation of the input multiset for any
+        # target correlation -- no length is invented or dropped.
+        lengths = [512, 640, 700, 900, 1024, 1500, 1800, 2048]
+        for rho in (-1.0, -0.5, 0.0, 0.5, 1.0):
+            out = _reorder_lengths_by_popularity(lengths, rho, seed=13)
+            self.assertEqual(sorted(out), sorted(lengths))
+
+    def test_reorder_lengths_degenerate_sizes(self):
+        # n <= 1 returns the input unchanged (nothing to correlate).
+        self.assertEqual(_reorder_lengths_by_popularity([], 0.8, seed=1), [])
+        self.assertEqual(_reorder_lengths_by_popularity([7], 0.8, seed=1), [7])
+
+    def test_reorder_lengths_deterministic_for_seed(self):
+        # Same (lengths, rho, seed) -> identical permutation; different seed
+        # generally differs (the noise draw changes).
+        lengths = list(range(400, 400 + 64 * 10, 10))
+        a = _reorder_lengths_by_popularity(lengths, 0.5, seed=100)
+        b = _reorder_lengths_by_popularity(lengths, 0.5, seed=100)
+        c = _reorder_lengths_by_popularity(lengths, 0.5, seed=101)
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+
+    @staticmethod
+    def _achieved_corr(lengths):
+        # Pearson correlation between popularity value (group 0 hottest ->
+        # n-1) and the group's assigned length -- the exact quantity the paper
+        # sweep reports.
+        n = len(lengths)
+        pop = np.arange(n - 1, -1, -1, dtype=np.float64)
+        return float(np.corrcoef(pop, np.asarray(lengths, dtype=np.float64))[0, 1])
+
+    def test_reorder_lengths_tracks_target_corr(self):
+        # The achieved Pearson correlation must track the target rho across the
+        # full [-1, 1] range. rho = +/-1 is exact (monotone assignment); the
+        # interior is exact only in expectation, so average over seeds and use
+        # a tolerance. Monotonicity of achieved-vs-target is the load-bearing
+        # property for the GDSF-gain-vs-rho curve.
+        n = 128
+        lengths = list(range(512, 512 + n))  # distinct -> no tie degeneracy
+        targets = [-1.0, -0.5, 0.0, 0.5, 1.0]
+        means = {}
+        for rho in targets:
+            achieved = [
+                self._achieved_corr(
+                    _reorder_lengths_by_popularity(lengths, rho, seed=s)
+                )
+                for s in range(20)
+            ]
+            means[rho] = float(np.mean(achieved))
+
+        # Endpoints are exact regardless of seed.
+        self.assertAlmostEqual(means[1.0], 1.0, places=6)
+        self.assertAlmostEqual(means[-1.0], -1.0, places=6)
+        # Interior tracks target within a modest tolerance (copula is exact in
+        # expectation; n=128 over 20 seeds keeps the estimate tight).
+        self.assertAlmostEqual(means[0.0], 0.0, delta=0.08)
+        self.assertAlmostEqual(means[0.5], 0.5, delta=0.10)
+        self.assertAlmostEqual(means[-0.5], -0.5, delta=0.10)
+        # Strictly monotone in the target -> the sweep axis is well ordered.
+        ordered = [means[t] for t in targets]
+        self.assertEqual(ordered, sorted(ordered))
+
+    def test_len_pop_corr_none_is_byte_identical(self):
+        # The whole point of Path B: passing len_pop_corr=None must leave the
+        # generated prompt pool byte-identical to before the feature existed.
+        # range_ratio < 1 so lengths actually vary (the reorder would bite if
+        # it ran), yet None must be a strict no-op.
+        common = dict(
+            mode="zipf",
+            alpha=1.3,
+            seed=77,
+            global_seed=77,
+            num_groups=8,
+            prompts_per_group=6,
+            system_prompt_len=64,
+            question_len=8,
+            output_len=4,
+            range_ratio=0.25,
+            ordered=True,
+        )
+        rows_none_a = self._run_gsp(len_pop_corr=None, **common)
+        rows_none_b = self._run_gsp(len_pop_corr=None, **common)
+        self.assertEqual(
+            self._row_fields(rows_none_a), self._row_fields(rows_none_b)
+        )
+
+    def test_len_pop_corr_preserves_question_pool(self):
+        # Setting len_pop_corr must only permute which prefix length lands on
+        # which group; it must NOT perturb the global RNG, so the per-slot
+        # question substrings stay byte-identical to the len_pop_corr=None run
+        # under the same global seed. (Prefix lengths change, questions don't.)
+        common = dict(
+            mode="zipf",
+            alpha=1.3,
+            seed=55,
+            global_seed=55,
+            num_groups=8,
+            prompts_per_group=5,
+            system_prompt_len=64,
+            question_len=8,
+            output_len=4,
+            range_ratio=0.25,
+            ordered=True,
+        )
+        rows_off = self._run_gsp(len_pop_corr=None, **common)
+        rows_on = self._run_gsp(len_pop_corr=0.8, **common)
+
+        delim = "\n\n"
+        q_off = [r.prompt.split(delim, 1)[1] for r in rows_off]
+        q_on = [r.prompt.split(delim, 1)[1] for r in rows_on]
+        self.assertEqual(q_off, q_on)
+
+    def test_len_pop_corr_cache_path_suffix(self):
+        # The on-disk cache key must fork on len_pop_corr so a correlated run
+        # never reads an uncorrelated (or differently-correlated) cache file.
+        base = dict(
+            seed=5,
+            num_groups=4,
+            prompts_per_group=3,
+            system_prompt_len=64,
+            question_len=8,
+            output_len=4,
+            tokenizer=self.tokenizer,
+            group_distribution="zipf",
+            zipf_alpha=1.3,
+        )
+        path_none = get_gen_prefix_cache_path(**base)
+        path_pos = get_gen_prefix_cache_path(len_pop_corr=0.8, **base)
+        path_neg = get_gen_prefix_cache_path(len_pop_corr=-0.8, **base)
+        self.assertNotEqual(path_none, path_pos)
+        self.assertNotEqual(path_pos, path_neg)
+        self.assertIn("_lpc0.8", path_pos.name)
+        self.assertIn("_lpc-0.8", path_neg.name)
+
+    # ------------------------------------------------------------------
     # CLI / from_args validation
     # ------------------------------------------------------------------
 
@@ -979,6 +1144,40 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             args = make_args(dataset_name="generated-shared-prefix", **case)
             with self.assertRaises(ValueError, msg=f"case={case}"):
                 GeneratedSharedPrefixDataset.from_args(args)
+
+    def test_from_args_rejects_invalid_len_pop_corr(self):
+        # from_args must reject an out-of-range or non-finite correlation, and
+        # a correlation requested without the zipf popularity axis (there is no
+        # popularity rank to correlate against under uniform).
+        cases = [
+            {"gsp_group_distribution": "zipf", "gsp_zipf_alpha": 1.3,
+             "gsp_len_pop_corr": 1.5},
+            {"gsp_group_distribution": "zipf", "gsp_zipf_alpha": 1.3,
+             "gsp_len_pop_corr": -1.5},
+            {"gsp_group_distribution": "zipf", "gsp_zipf_alpha": 1.3,
+             "gsp_len_pop_corr": float("nan")},
+            {"gsp_group_distribution": "zipf", "gsp_zipf_alpha": 1.3,
+             "gsp_len_pop_corr": float("inf")},
+            {"gsp_group_distribution": "uniform", "gsp_zipf_alpha": None,
+             "gsp_len_pop_corr": 0.5},
+        ]
+        for case in cases:
+            args = make_args(dataset_name="generated-shared-prefix", **case)
+            with self.assertRaises(ValueError, msg=f"case={case}"):
+                GeneratedSharedPrefixDataset.from_args(args)
+
+    def test_from_args_accepts_valid_len_pop_corr(self):
+        # A finite correlation in [-1, 1] with zipf must construct cleanly and
+        # round-trip onto the dataclass field.
+        for rho in (-1.0, -0.4, 0.0, 0.4, 1.0):
+            args = make_args(
+                dataset_name="generated-shared-prefix",
+                gsp_group_distribution="zipf",
+                gsp_zipf_alpha=1.3,
+                gsp_len_pop_corr=rho,
+            )
+            ds = GeneratedSharedPrefixDataset.from_args(args)
+            self.assertEqual(ds.len_pop_corr, rho)
 
     def test_bench_serving_help_and_invalid_choice_argparse(self):
         # Subprocess-driven coverage of the live CLI: --help advertises both
@@ -1079,6 +1278,42 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         stderr = res.stderr + res.stdout
         self.assertIn("--gsp-group-distribution", stderr)
         self.assertIn("--gsp-zipf-alpha", stderr)
+        for forbidden in [
+            "HTTPConnectionPool",
+            "HTTPSConnectionPool",
+            "Connection refused",
+            "Failed to fetch model",
+            "Traceback",
+        ]:
+            self.assertNotIn(forbidden, stderr)
+
+    def test_bench_serving_cli_rejects_bad_len_pop_corr_before_server(self):
+        # --gsp-len-pop-corr with range_ratio >= 1 (the default) must fail at
+        # argparse time: with uniform prefix lengths the correlation axis is
+        # undefined. Users must see the GSP-flag error, not a network failure.
+        res = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sglang.benchmark.serving",
+                "--dataset-name",
+                "generated-shared-prefix",
+                "--gsp-group-distribution",
+                "zipf",
+                "--gsp-zipf-alpha",
+                "1.3",
+                "--gsp-len-pop-corr",
+                "0.8",
+                "--ready-check-timeout-sec",
+                "0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        self.assertEqual(res.returncode, 2, res.stderr)
+        stderr = res.stderr + res.stdout
+        self.assertIn("--gsp-len-pop-corr", stderr)
         for forbidden in [
             "HTTPConnectionPool",
             "HTTPSConnectionPool",

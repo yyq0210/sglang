@@ -438,10 +438,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Mamba (GDN) checkpoint eviction policy (experiment-only expert A/B knob).
         # "lru" (default) reproduces the prior recency-only victim selection exactly;
         # "value" evicts the lowest-value checkpoint first (value = reuse frequency,
-        # recency as tie-break). Reordering this degradable tier is accuracy-neutral
-        # (a miss re-prefills the prefix exactly); it only trades for hit-rate.
+        # recency as tie-break); "gdsf" weights that value by reconstruction cost
+        # (prefix length) so expensive-to-rebuild hot prefixes stay resident. All
+        # reorder a degradable tier only (a miss re-prefills the prefix exactly), so
+        # they trade for hit-rate / TTFT, never for correctness.
         self.mamba_evict_policy = envs.SGLANG_MAMBA_EVICT_POLICY.get()
-        if self.mamba_evict_policy not in ("lru", "value"):
+        if self.mamba_evict_policy not in ("lru", "value", "gdsf"):
             self.mamba_evict_policy = "lru"
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
@@ -479,6 +481,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.mamba_evictable_size_ = 0
         self.full_protected_size_ = 0
         self.mamba_protected_size_ = 0
+        # GDSF aging clock for cost-aware mamba eviction (policy="gdsf"); zeroed on
+        # reset/flush so a fresh cache starts with an un-inflated priority floor.
+        self.gdsf_clock = 0.0
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
@@ -818,6 +823,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             return 0
         if self.mamba_evict_policy == "value":
             return self._evict_mamba_value(mamba_num)
+        if self.mamba_evict_policy == "gdsf":
+            return self._evict_mamba_gdsf(mamba_num)
         # get the least recently used node that is not locked, doesn't have to be a leaf
         x = self.mamba_lru_list.get_lru_no_lock()
         mamba_num_evicted = 0
@@ -884,6 +891,81 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 len(x.mamba_value) == 1
             ), f"node has abnormal mamba length, {x.id=}, {len(x.mamba_value)=}"
             assert x != self.root_node, f"root node is not evictable, {x.id=}"
+
+            if len(x.children) > 0:
+                # an internal node: free its own mamba checkpoint, tombstone the node
+                self._free_mamba_value(x.mamba_value)
+                mamba_num_evicted += len(x.mamba_value)
+                self.mamba_lru_list.remove_node(x)
+                self._tombstone_internal_node(x)
+            else:
+                _, mamba_evicted_delta, _, _ = self._evict_leaf_node(x, True)
+                mamba_num_evicted += mamba_evicted_delta
+
+        return mamba_num_evicted
+
+    def _recon_cost(self, node: TreeNode) -> int:
+        """Reconstruction cost of a mamba checkpoint = its prefix token length.
+
+        The checkpoint SLOT is fixed O(1) size regardless of prefix length
+        (len(mamba_value)==1), but an eviction MISS re-prefills the whole prefix, so
+        the true cost of dropping this checkpoint scales with prefix length. Walk the
+        path root->node summing per-page hash counts (hash_value persists through
+        full-KV eviction and mamba tombstoning) and scale by page_size. Floored at 1
+        so cost-aware ordering never collapses to a pure tie when hashes are absent.
+        """
+        pages = 0
+        cur = node
+        while cur is not None and cur is not self.root_node:
+            if cur.hash_value is not None:
+                pages += len(cur.hash_value)
+            cur = cur.parent
+        return max(pages * self.page_size, 1)
+
+    def _evict_mamba_gdsf(self, mamba_num: int) -> int:
+        """Cost-aware GDSF mamba checkpoint eviction (SGLANG_MAMBA_EVICT_POLICY="gdsf").
+
+        Generalizes the frequency-only "value" policy by weighting each victim's score
+        by RECONSTRUCTION COST (prefix length):
+            H(x) = gdsf_clock + (hit_count(x) + 1) * recon_cost(x)
+        evict lowest H first, then advance the aging clock to the evicted H (classic
+        Greedy-Dual-Size-Frequency; the mamba slot has fixed size so the size term
+        drops out and cost = prefix length is the only remaining weight). This keeps
+        expensive-to-rebuild hot prefixes resident under skewed popularity + varied
+        prefix lengths, while the aging clock keeps a once-hot long prefix from being
+        immortal. The (hit_count+1) offset means even never-reused checkpoints are
+        ordered by cost (evict the cheapest-to-rebuild first). value/LFU is the
+        uniform-length special case (recon_cost constant => cancels out of the order).
+
+        Accuracy-neutral like "value": the checkpoint is a degradable/reconstructable
+        tier (Phase A2 causal ablation), so an eviction miss re-prefills the prefix
+        exactly -- reordering victims trades only for hit-rate / TTFT, never for
+        correctness.
+        """
+        # Snapshot evictable (unlocked) mamba nodes into an H-ordered min-heap. Node
+        # id (unique) is the final tie-break so TreeNode is never compared directly.
+        heap = []
+        for node in self.mamba_lru_list.cache.values():
+            if node.mamba_lock_ref != 0:
+                continue
+            H = self.gdsf_clock + (node.hit_count + 1) * self._recon_cost(node)
+            heap.append((H, node.last_access_time, node.id, node))
+        heapq.heapify(heap)
+
+        mamba_num_evicted = 0
+        while mamba_num_evicted < mamba_num and heap:
+            H, _, _, x = heapq.heappop(heap)
+            # Skip stale entries: the node may have been freed as a tombstone-leaf
+            # side effect of an earlier eviction, or locked since the snapshot.
+            if not self.mamba_lru_list.in_list(x) or x.mamba_lock_ref != 0:
+                continue
+            assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
+            assert (
+                len(x.mamba_value) == 1
+            ), f"node has abnormal mamba length, {x.id=}, {len(x.mamba_value)=}"
+            assert x != self.root_node, f"root node is not evictable, {x.id=}"
+            # advance the GDSF aging clock to the priority of the evicted item
+            self.gdsf_clock = max(self.gdsf_clock, H)
 
             if len(x.children) > 0:
                 # an internal node: free its own mamba checkpoint, tombstone the node
