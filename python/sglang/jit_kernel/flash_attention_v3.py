@@ -17,14 +17,37 @@ DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
 
 
 def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
-    if out is None:
-        return kernel(*args, **kwargs)
-    try:
-        return kernel(*args, **kwargs, out=out)
-    except TypeError as exc:
-        if "unexpected keyword argument 'out'" not in str(exc):
-            raise
-        return kernel(*args, **kwargs)
+    # ENVIRONMENT WORKAROUND (cu12.9 boxes): an older compiled FA3 kernel
+    # (sgl-kernel 0.4.2.post2) predates newer kwargs like `only_qv` / `sinks`.
+    # Kimi-Linear's full-attention layers pass these. When
+    # the kernel rejects an unknown kwarg AND that kwarg is falsy (None/0/False)
+    # -> it's a no-op, so strip it and retry. If it's truthy we re-raise, since
+    # dropping a meaningful arg would be a silent correctness bug.
+    def _invoke(kw):
+        while True:
+            try:
+                if out is None:
+                    return kernel(*args, **kw)
+                try:
+                    return kernel(*args, **kw, out=out)
+                except TypeError as exc:
+                    if "unexpected keyword argument 'out'" not in str(exc):
+                        raise
+                    return kernel(*args, **kw)
+            except TypeError as exc:
+                msg = str(exc)
+                dropped = None
+                for name in list(kw.keys()):
+                    if f"unexpected keyword argument '{name}'" in msg:
+                        if kw[name]:
+                            raise
+                        dropped = name
+                        break
+                if dropped is None:
+                    raise
+                kw = {k: v for k, v in kw.items() if k != dropped}
+
+    return _invoke(dict(kwargs))
 
 
 @cache_once
