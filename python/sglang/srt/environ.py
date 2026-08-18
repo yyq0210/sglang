@@ -702,16 +702,55 @@ class Envs:
     # Local heads with tau > seam are only PARTIALLY reconstructed -> accuracy is an
     # empirical question (gsm8k judges it).
     SGLANG_HEAD_AWARE_SEAM_WINDOW = EnvInt(None)
+    # Head-aware GDN checkpoint: pack the exact GLOBAL-head state buffer per-layer
+    # (ragged) instead of padding every layer to G_max = max_l(#global heads).
+    # Capacity gain = G_max / mean_l(#global) (the [ragged-diag] max/mean gap). For
+    # per-head GDN where most heads stay global (mean ≈ G_max) this is a small win
+    # (~1.1x); it only helps when the per-layer #global count varies. Off (default)
+    # -> the legacy G_max-padded [L, num_slots, G_max, d_v, d_k] buffer, byte-
+    # identical. Non-per-channel (GDN) only; ignored for KDA per-channel.
+    SGLANG_HEAD_AWARE_RAGGED = EnvBool(False)
     # Mamba (GDN) radix checkpoint eviction policy. Expert A/B knob (experiment-only).
     # The GDN checkpoint is a degradable/reconstructable tier (Phase A2 causal ablation:
     # zeroing the GDN state leaves recall intact on hybrid models), so reordering its
-    # eviction is accuracy-neutral -- a hit re-uses the cached state, a miss re-prefills
+    # eviction is accuracy-neutral -- a hit reuses the cached state, a miss re-prefills
     # the prefix exactly. That licenses replacing plain recency (LRU) with a value-aware
     # order that keeps the most-reused checkpoints, trading nothing in accuracy for a
     # higher cached-prefix hit-rate under skewed (Zipf) prefix popularity.
     #   "lru"   -> default, evict least-recently-used (byte-identical to prior behavior)
     #   "value" -> evict lowest-value first, value = (hit_count, last_access_time)
     SGLANG_MAMBA_EVICT_POLICY = EnvStr("lru")
+    # Log a DIRECT counter every time a prefix-cache hit restores a mamba checkpoint
+    # into the active pool (the compressed-restore path: load_to_active). Turns the
+    # "compression path was exercised" claim from a strong inference off the token-
+    # level radix hit-rate into a hard per-run count: #restore calls, #slots, and the
+    # per-hit dropped-unit count (Route-A local heads/columns). dense (W_max=0) ->
+    # dropped=0; idea1 -> dropped>0 == compression provably executed. Off (default)
+    # -> one cheap bool check per hit, byte-identical otherwise. Experiment-only.
+    SGLANG_LOG_CKPT_LOAD = EnvBool(False)
+    # Head-aware ABLATION: replace the decay-aware (tau) global/local classification
+    # with a COUNT-MATCHED RANDOM drop. Per layer, keep EXACTLY the same number of
+    # local (dropped) units as the tau plan would -> identical compression ratio /
+    # capacity bytes -> only "which units are dropped" changes (tau vs random). This
+    # isolates the value of the decay-aware selection from the value of merely dropping
+    # that many units. Seeded (SGLANG_HEAD_AWARE_RANDOM_SEED) for reproducibility.
+    # Off (default) -> tau plan, byte-identical. Experiment-only.
+    SGLANG_HEAD_AWARE_RANDOM_DROP = EnvBool(False)
+    SGLANG_HEAD_AWARE_RANDOM_SEED = EnvInt(1234)
+    # Fake quantization of the head-aware checkpoint state. Quantize on
+    # checkpoint store, dequantize on load -> tests the accuracy impact of
+    # uniform INT8/INT4 quantization at matched compression ratios vs DASC
+    # (which drops units selectively).  When set, the checkpoint buffer
+    # switches from BF16 to int8/int4 + per-group BF16 scale.
+    #   "none"  -> BF16 state, no quantization (byte-identical default)
+    #   "int8"  -> per-group symmetric INT8 (QMAX=127)
+    #   "int4"  -> per-group symmetric INT4 (QMAX=7, stored as packed int8)
+    # Group size = SGLANG_STATE_QUANT_GROUP_SIZE (default 128 = d_v).
+    # Experiment-only; does NOT change the computation kernel (dequantizes
+    # to BF16 on load), so latency per decode-step is unchanged — measures
+    # accuracy + bytes/slot impact, not kernel speedup.
+    SGLANG_STATE_QUANT_MODE = EnvStr("none")
+    SGLANG_STATE_QUANT_GROUP_SIZE = EnvInt(128)
 
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)

@@ -33,6 +33,52 @@ logger = logging.getLogger(__name__)
 # One-shot guard for the C2 seam-window observability log (see build_reprefill_batch).
 _logged_first_recon = False
 
+# Aggregated Route-A reconstruction counters (P0-4: actual replay length != W_max).
+# Accumulated across every build_reprefill_batch call since the last reset. The
+# w_max-sweep experiment resets these after warm-up (via /reset_peak_memory) and
+# reads them after the measure window so the reported replay-token distribution
+# reflects the real per-hit min(W_max, P) rather than the plan's W_max ceiling.
+# Plain dict (no msgspec) — these are process-local observability, not IPC'd.
+_recon_counters = {"n_hits": 0, "total_replay_tokens": 0, "lens": []}
+
+
+def reset_recon_counters() -> None:
+    """Zero the aggregated Route-A reconstruction counters (call after warm-up)."""
+    _recon_counters["n_hits"] = 0
+    _recon_counters["total_replay_tokens"] = 0
+    _recon_counters["lens"] = []
+
+
+def get_recon_counters() -> dict:
+    """Snapshot of the aggregated reconstruction counters (read after measure)."""
+    lens = _recon_counters["lens"]
+    n = _recon_counters["n_hits"]
+    import statistics
+
+    return {
+        "n_recon_hits": n,
+        "total_replay_tokens": _recon_counters["total_replay_tokens"],
+        "replay_tokens_mean": round(statistics.mean(lens), 1) if lens else 0.0,
+        "replay_tokens_median": round(statistics.median(lens), 1) if lens else 0.0,
+        "replay_tokens_p95": round(_pct(lens, 0.95), 1) if lens else 0.0,
+        "replay_tokens_max": max(lens) if lens else 0,
+    }
+
+
+def _pct(data, q):
+    if not data:
+        return 0.0
+    s = sorted(data)
+    k = (len(s) - 1) * q
+    import math
+
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return float(s[int(k)])
+    return float(s[f] * (c - k) + s[c] * (k - f))
+
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -85,8 +131,6 @@ def get_head_aware_route_a_pool(model_runner: ModelRunner):
         return None
     store = getattr(pool, "store", None)
     if store is None:  # plan not built yet
-        return None
-    if getattr(pool, "route", None) != "A":
         return None
     if getattr(store.plan, "W_max", 0) <= 0:
         return None
@@ -230,6 +274,12 @@ def build_reprefill_batch(
             int(pool.store.plan.W_max),
             recon_win_lens,
         )
+    # Aggregate the REAL per-hit replay lengths (P - base = min(W, P)) into the
+    # module counters so the w_max-sweep experiment can report the actual replay-
+    # token distribution rather than assuming W_max (P0-4: P << W_max at high W).
+    _recon_counters["n_hits"] += len(recon_reqs)
+    _recon_counters["total_replay_tokens"] += sum(recon_win_lens)
+    _recon_counters["lens"].extend(recon_win_lens)
     return recon_reqs, recon_win_lens, reprefill
 
 

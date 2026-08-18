@@ -1810,15 +1810,15 @@ class ServerArgs:
     ] = None
     enable_head_aware_mamba_checkpoint: A[
         bool,
-        "Store radix-cached GDN (mamba) states head-aware: global heads (decay tau>window) keep the exact [K,V] state; local heads are dropped and rebuilt on a hit (Route A: re-prefill last-W tokens; Route B: replay the stored last-W (k,v,g,beta) window through one GDN layer). Smaller bytes/slot -> more cached-prefix capacity. Mutually exclusive with --enable-int8-mamba-checkpoint.",
+        "Store radix-cached GDN (mamba) states head-aware: global heads (decay tau>window) keep the exact [K,V] state; local heads are dropped and rebuilt on a hit by re-prefilling last-W tokens through the full model. Smaller bytes/slot -> more cached-prefix capacity. Mutually exclusive with --enable-int8-mamba-checkpoint.",
     ] = False
     head_aware_route: A[
         str,
         Arg(
-            help="Head-aware local-head reconstruction route: 'B' stores the last-W (k,v,g,beta) window and replays it through one GDN layer on a hit (~1.1x capacity, cheap recon); 'A' stores only global-head state and re-prefills the last-W prefix tokens through the full model on a hit (2.6-4.6x capacity, costlier recon).",
-            choices=["A", "B"],
+            help="Head-aware local-head reconstruction route. Only 'A' is supported: stores only global-head state and re-prefills the last-W prefix tokens through the full model on a hit.",
+            choices=["A"],
         ),
-    ] = "B"
+    ] = "A"
     head_aware_mamba_ckpt_size: A[
         Optional[int],
         "Number of head-aware mamba checkpoint slots (default: sized so the head-aware pool matches the int8 pool's HBM budget, i.e. capacity scales with the byte savings).",

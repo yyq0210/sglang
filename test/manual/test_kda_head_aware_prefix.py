@@ -75,7 +75,9 @@ def _load_real_kda_weights(model_dir, d_k):
     kda = []
     for p in prefixes:
         a = a_by_prefix[p].float().flatten()  # [HV]
-        dt = dt_by_prefix[p].float().flatten()  # [HV*d_k] for KDA, [HV] for a scalar layer
+        dt = (
+            dt_by_prefix[p].float().flatten()
+        )  # [HV*d_k] for KDA, [HV] for a scalar layer
         if dt.numel() == a.numel() * d_k:
             kda.append((a, dt))
     if not kda:
@@ -137,12 +139,20 @@ def main():
     p.add_argument("--k", type=int, default=128, help="d_k (head_k_dim)")
     p.add_argument("--v", type=int, default=128, help="d_v (head_v_dim)")
     p.add_argument("--prefix-len", type=int, default=1024, help="T tokens")
-    p.add_argument("--w-max", type=int, default=512,
-                   help="global/local column threshold: tau>w_max -> global (exact)")
+    p.add_argument(
+        "--w-max",
+        type=int,
+        default=512,
+        help="global/local column threshold: tau>w_max -> global (exact)",
+    )
     p.add_argument("--eps", type=float, default=1e-3)
     p.add_argument("--a-scale", type=float, default=0.3)
-    p.add_argument("--a-margin", type=float, default=None,
-                   help="classify at a=-a_margin (slower decay). Default = a_scale.")
+    p.add_argument(
+        "--a-margin",
+        type=float,
+        default=None,
+        help="classify at a=-a_margin (slower decay). Default = a_scale.",
+    )
     p.add_argument("--dtype", choices=["fp32", "fp64"], default="fp32")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -170,8 +180,14 @@ def main():
 
     # ---- build the per-channel plan (Route A only for KDA) -------------------
     plan = HeadAwarePlan.build_plan(
-        A_log=A_log, dt_bias=dt_bias, route="A", d_k=K, d_v=V, eps=eps,
-        w_max=args.w_max, a_margin=a_margin,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        route="A",
+        d_k=K,
+        d_v=V,
+        eps=eps,
+        w_max=args.w_max,
+        a_margin=a_margin,
     )
     assert plan.per_channel, "KDA dt_bias should dispatch to the per-channel plan"
 
@@ -180,8 +196,9 @@ def main():
     ok_cls = True
     n_local = n_global = 0
     for l in range(L):
-        g_repr = gdn_gate(torch.full((HV, K), -a_margin, dtype=dt),
-                          A_log[l][:, None], dt3[l])
+        g_repr = gdn_gate(
+            torch.full((HV, K), -a_margin, dtype=dt), A_log[l][:, None], dt3[l]
+        )
         tau = tau_from_g(g_repr, eps)  # [HV, K]
         want_local = torch.isfinite(tau) & (tau <= float(args.w_max))
         got_local = plan.w_chan[l] > 0
@@ -189,13 +206,15 @@ def main():
         n_local += int(want_local.sum())
         n_global += int((~want_local).sum())
     tot = L * HV * K
-    print(f"\n  (1) classification: {n_local}/{tot} local columns, "
-          f"{n_global}/{tot} global (exact); GU_max={plan.GU_max}  "
-          f"-> {'OK' if ok_cls else 'FAIL'}")
+    print(
+        f"\n  (1) classification: {n_local}/{tot} local columns, "
+        f"{n_global}/{tot} global (exact); GU_max={plan.GU_max}  "
+        f"-> {'OK' if ok_cls else 'FAIL'}"
+    )
 
     # ---- (2) store -> load round-trip ---------------------------------------
     store = HeadAwareCheckpointStore(
-        plan=plan, num_slots=4, device="cpu", state_dtype=dt, win_dtype=dt
+        plan=plan, num_slots=4, device="cpu", state_dtype=dt
     )
     # a random dense state per (layer, head): [L, N=1, HV, V, K]
     state = torch.randn(L, 1, HV, V, K, dtype=dt)
@@ -214,12 +233,16 @@ def main():
     ok_global = max_global_err < 1e-6
     ok_local_zero = max_local_abs < 1e-12
     ok_mask = bool((mask.cpu() == is_local).all())
-    print(f"  (2) round-trip: global cols max|dS|={max_global_err:.2e} (want ~0), "
-          f"local cols max|val|={max_local_abs:.2e} (want 0), "
-          f"mask==w_chan>0 {ok_mask}")
-    print(f"      -> global-exact {'OK' if ok_global else 'FAIL'}, "
-          f"local-zeroed {'OK' if ok_local_zero else 'FAIL'}, "
-          f"mask {'OK' if ok_mask else 'FAIL'}")
+    print(
+        f"  (2) round-trip: global cols max|dS|={max_global_err:.2e} (want ~0), "
+        f"local cols max|val|={max_local_abs:.2e} (want 0), "
+        f"mask==w_chan>0 {ok_mask}"
+    )
+    print(
+        f"      -> global-exact {'OK' if ok_global else 'FAIL'}, "
+        f"local-zeroed {'OK' if ok_local_zero else 'FAIL'}, "
+        f"mask {'OK' if ok_mask else 'FAIL'}"
+    )
 
     # ---- (3) capacity --------------------------------------------------------
     bps = store.bytes_per_slot()
@@ -230,25 +253,35 @@ def main():
     A_gdn = A_log  # [L, HV]
     dt_gdn = dt3.mean(dim=2)  # collapse to a per-head [L, HV] scalar dt_bias
     plan_g = HeadAwarePlan.build_plan(
-        A_log=A_gdn, dt_bias=dt_gdn, route="A", d_k=K, d_v=V, eps=eps,
-        w_max=args.w_max, a_margin=a_margin,
+        A_log=A_gdn,
+        dt_bias=dt_gdn,
+        route="A",
+        d_k=K,
+        d_v=V,
+        eps=eps,
+        w_max=args.w_max,
+        a_margin=a_margin,
     )
     ok_gdn_path = not plan_g.per_channel
     store_g = HeadAwareCheckpointStore(
-        plan=plan_g, num_slots=4, device="cpu", state_dtype=dt, win_dtype=dt
+        plan=plan_g, num_slots=4, device="cpu", state_dtype=dt
     )
     store_g.store(slot, state)
     rec_g, mask_g = store_g.load(slot, out_dtype=dt)
     loc_h = plan_g.w_head > 0  # [L, HV]
     gl_h = (~loc_h)[:, None, :, None, None].expand_as(rec_g)
     lo_h = loc_h[:, None, :, None, None].expand_as(rec_g)
-    ok_gdn_glob = (rec_g[gl_h] - state[gl_h]).abs().max().item() < 1e-6 if gl_h.any() else True
+    ok_gdn_glob = (
+        (rec_g[gl_h] - state[gl_h]).abs().max().item() < 1e-6 if gl_h.any() else True
+    )
     ok_gdn_zero = (rec_g[lo_h].abs().max().item() < 1e-12) if lo_h.any() else True
     ok_gdn_mask = bool((mask_g.cpu() == loc_h).all())
-    print(f"  (4) GDN non-regression: per_channel={plan_g.per_channel} (want False), "
-          f"global-exact {'OK' if ok_gdn_glob else 'FAIL'}, "
-          f"local-zeroed {'OK' if ok_gdn_zero else 'FAIL'}, "
-          f"mask {'OK' if ok_gdn_mask else 'FAIL'}")
+    print(
+        f"  (4) GDN non-regression: per_channel={plan_g.per_channel} (want False), "
+        f"global-exact {'OK' if ok_gdn_glob else 'FAIL'}, "
+        f"local-zeroed {'OK' if ok_gdn_zero else 'FAIL'}, "
+        f"mask {'OK' if ok_gdn_mask else 'FAIL'}"
+    )
 
     # ---- (informational) local-column re-prefill reconstruction --------------
     _reprefill_recon_info(args, A_log, dt3, state[:, 0], K, V, T, eps, plan, dt)
@@ -257,9 +290,17 @@ def main():
     ok_copy = _validate_copy_back(plan, L, HV, V, K, dt)
     print(f"  (5) per-channel masked copy-back: {'OK' if ok_copy else 'FAIL'}")
 
-    all_ok = (ok_cls and ok_global and ok_local_zero and ok_mask
-              and ok_gdn_path and ok_gdn_glob and ok_gdn_zero and ok_gdn_mask
-              and ok_copy)
+    all_ok = (
+        ok_cls
+        and ok_global
+        and ok_local_zero
+        and ok_mask
+        and ok_gdn_path
+        and ok_gdn_glob
+        and ok_gdn_zero
+        and ok_gdn_mask
+        and ok_copy
+    )
     print(f"\n  GATE-K1 RESULT: {'PASS' if all_ok else 'FAIL'}")
     if not all_ok:
         raise SystemExit(1)
@@ -291,21 +332,24 @@ def _validate_copy_back(plan, L, HV, V, K, dt):
     n_slots = 4
     temporal = torch.zeros(L, n_slots, HV, V, K, dtype=dt)
     scratch_slot, active_slot = 2, 1
-    scratch_state = torch.randn(L, HV, V, K, dtype=dt)   # the re-prefill result
-    ckpt_global = torch.randn(L, HV, V, K, dtype=dt)     # exact global@P
-    is_local = plan.w_chan > 0                            # [L, HV, K]
-    lo = is_local[:, :, None, :].expand(L, HV, V, K)      # broadcast over d_v
+    scratch_state = torch.randn(L, HV, V, K, dtype=dt)  # the re-prefill result
+    ckpt_global = torch.randn(L, HV, V, K, dtype=dt)  # exact global@P
+    is_local = plan.w_chan > 0  # [L, HV, K]
+    lo = is_local[:, :, None, :].expand(L, HV, V, K)  # broadcast over d_v
 
     temporal[:, scratch_slot] = scratch_state
     # active slot = checkpoint: global cols exact, local cols zero (as load leaves).
-    temporal[:, active_slot] = torch.where(lo, torch.zeros_like(ckpt_global), ckpt_global)
+    temporal[:, active_slot] = torch.where(
+        lo, torch.zeros_like(ckpt_global), ckpt_global
+    )
 
     active = _StubActivePool(temporal, is_local.clone())
     # call the real seam (build a bare pool object without running __init__)
     pool = HeadAwareCheckpointPool.__new__(HeadAwareCheckpointPool)
     pool.store = _StoreShim(plan.per_channel, L)
-    pool.copy_local_rows_from_scratch(active, torch.tensor([scratch_slot]),
-                                      torch.tensor([active_slot]))
+    pool.copy_local_rows_from_scratch(
+        active, torch.tensor([scratch_slot]), torch.tensor([active_slot])
+    )
 
     result = temporal[:, active_slot]
     want = torch.where(lo, scratch_state, ckpt_global)  # local<-scratch, global<-ckpt
@@ -314,8 +358,10 @@ def _validate_copy_back(plan, L, HV, V, K, dt):
     untouched = (temporal[:, scratch_slot] - scratch_state).abs().max().item()
     mask_cleared = active.mamba_head_reprefill_mask is None
     ok = err < 1e-6 and untouched < 1e-12 and mask_cleared
-    print(f"      assembled max|dS|={err:.2e} (want 0), scratch untouched "
-          f"{untouched:.2e}, mask cleared {mask_cleared}")
+    print(
+        f"      assembled max|dS|={err:.2e} (want 0), scratch untouched "
+        f"{untouched:.2e}, mask cleared {mask_cleared}"
+    )
     return ok
 
 
@@ -358,19 +404,27 @@ def _reprefill_recon_info(args, A_log, dt3, state_exact, K, V, T, eps, plan, dt)
         v_seq = torch.randn(T, HV, V, dtype=dt)
         g_seq = gdn_gate(a_seq, A_log[l][:, None], dt3[l])  # [T, HV, K]
         beta_seq = torch.sigmoid(b_seq)
-        S_exact = _kda_recurrence(torch.zeros(HV, V, K, dtype=dt),
-                                  k_seq, v_seq, g_seq, beta_seq)
+        S_exact = _kda_recurrence(
+            torch.zeros(HV, V, K, dtype=dt), k_seq, v_seq, g_seq, beta_seq
+        )
         sl = slice(T - W, T)
-        S_scratch = _kda_recurrence(torch.zeros(HV, V, K, dtype=dt),
-                                    k_seq[sl], v_seq[sl], g_seq[sl], beta_seq[sl])
+        S_scratch = _kda_recurrence(
+            torch.zeros(HV, V, K, dtype=dt),
+            k_seq[sl],
+            v_seq[sl],
+            g_seq[sl],
+            beta_seq[sl],
+        )
         # assemble: global columns from exact (== checkpoint), local from scratch
         local = plan.w_chan[l] > 0  # [HV, K]
         S_asm = torch.where(local[:, None, :], S_scratch, S_exact)
         dS = _fro(S_asm - S_exact)
         scale = _fro(S_exact).clamp(min=1e-12)
         max_rel = max(max_rel, float((dS / scale).max()))
-    print(f"    max assembled relative error over {L} layers = {max_rel:.3e}  "
-          f"(informational; Route A re-prefill accuracy is measured on-model)")
+    print(
+        f"    max assembled relative error over {L} layers = {max_rel:.3e}  "
+        f"(informational; Route A re-prefill accuracy is measured on-model)"
+    )
 
 
 if __name__ == "__main__":

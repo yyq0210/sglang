@@ -2,6 +2,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.debug import state_ablation
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -288,19 +289,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
 
-        # Route-B head-aware prefix cache: build the (k,v,g,beta) window capturer so
-        # local heads dropped from the checkpoint can be replayed on a hit. No-op
-        # for every other checkpoint variant / Route A (returns None).
-        self.head_aware_window_capturer = None
-        ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
-        if ckpt_pool is not None and hasattr(ckpt_pool, "maybe_build_window_capturer"):
-            mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
-            self.head_aware_window_capturer = ckpt_pool.maybe_build_window_capturer(
-                mamba_map=self.req_to_token_pool.mamba_map,
-                mamba_num_slots=mamba_cache.temporal.shape[1],
-                dtype=mamba_cache.temporal.dtype,
-            )
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
@@ -327,6 +315,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
+
+        # Phase A2/H causal ablation (experiment-only): corrupt the GDN recurrent
+        # state in place before the kernel reads it, so the linear tier carries no
+        # cross-step memory. No-op unless ABLATE_LINEAR_STATE is set.
+        if state_ablation.linear_state_enabled():
+            state_ablation.corrupt_linear_state_(ssm_states, cache_indices)
 
         assert isinstance(mixed_qkv, torch.Tensor)
         mixed_qkv = causal_conv1d_update(
@@ -412,6 +406,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
+
+        # Phase A2/H causal ablation (experiment-only): corrupt the GDN recurrent
+        # state that folds the cached prefix before the extend kernel reads it as the
+        # chunk's initial state. No-op unless ABLATE_LINEAR_STATE is set.
+        if state_ablation.linear_state_enabled():
+            state_ablation.corrupt_linear_state_(ssm_states, cache_indices)
+
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
@@ -505,18 +506,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            if self.head_aware_window_capturer is not None and not self.is_draft_worker:
-                # Save the last-W (k,v,g,beta) local-head window for this prefill so
-                # the head-aware checkpoint can donate it if this state is cached.
-                self.head_aware_window_capturer.capture_extend(
-                    layer.layer_id,
-                    key,
-                    value,
-                    g,
-                    beta,
-                    query_start_loc,
-                    cache_indices,
-                )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
