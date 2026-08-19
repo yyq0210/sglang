@@ -8,6 +8,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+from sglang.srt.debug import state_ablation
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -402,6 +403,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
 
+        # Phase A2/H causal ablation (experiment-only): corrupt the GDN recurrent
+        # state in place before the kernel reads it, so the linear tier carries no
+        # cross-step memory. No-op unless ABLATE_LINEAR_STATE is set.
+        if state_ablation.linear_state_enabled():
+            state_ablation.corrupt_linear_state_(ssm_states, cache_indices)
+
         assert isinstance(mixed_qkv, torch.Tensor)
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
@@ -491,6 +498,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
+
+        # Phase A2/H causal ablation (experiment-only): corrupt the GDN recurrent
+        # state that folds the cached prefix before the extend kernel reads it as the
+        # chunk's initial state. No-op unless ABLATE_LINEAR_STATE is set.
+        if state_ablation.linear_state_enabled():
+            state_ablation.corrupt_linear_state_(ssm_states, cache_indices)
+
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm

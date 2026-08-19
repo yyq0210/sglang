@@ -155,6 +155,10 @@ MultimodalDataInputFormat = Union[
     MultimodalDataInputItem,
 ]
 
+# Serialized form of BaseFinishReason.to_json() — all values are primitives.
+FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
+CachedTokensDetails = Dict[str, Union[int, str]]
+
 
 @dataclass
 class GenerateReqInput:
@@ -877,9 +881,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    return_indexer_topk: bool = False
     # See GenerateReqInput.routed_experts_start_len.
     routed_experts_start_len: int = 0
-    return_indexer_topk: bool = False
 
     # Session info for continual prompting
     session_id: Optional[str] = None
@@ -1799,7 +1803,7 @@ class InitWeightsUpdateGroupReqInput(BaseReq, kw_only=True):
     # The master address
     master_address: str
     # The master port
-    master_port: int
+    master_port: Union[int, str]
     # The rank offset
     rank_offset: int
     # The world size

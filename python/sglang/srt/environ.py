@@ -980,6 +980,44 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+
+    # Head-aware mamba checkpoint (experiment-only; see
+    # docs/head_aware_prefix_cache_paper.md). All default-off / byte-identical
+    # when unset.
+    # Route-A re-prefill: on a head-aware checkpoint hit, rebuild the dropped
+    # local-head state by re-prefilling the last-W prefix tokens through the
+    # full model. Off -> no-recon (return the global-head state as-is).
+    SGLANG_ENABLE_HEAD_AWARE_REPREFILL = EnvBool(False)
+    # Ragged (per-layer packed) head-aware buffer: store exactly each layer's
+    # #valid units instead of the GU_max-padded layout. Off -> padded (legacy).
+    SGLANG_HEAD_AWARE_RAGGED = EnvBool(False)
+    # Seam window: shrink ONLY the re-prefill span to the last `seam` tokens
+    # (local heads with tau > seam are partially reconstructed). Unset/<=0 ->
+    # full W_max.
+    SGLANG_HEAD_AWARE_SEAM_WINDOW = EnvInt(None)
+    # Random-drop ablation: replace the decay-aware (tau) global/local split
+    # with a count-matched random one (same compression ratio; isolates the
+    # value of the decay-aware selection). Off -> tau plan, byte-identical.
+    SGLANG_HEAD_AWARE_RANDOM_DROP = EnvBool(False)
+    SGLANG_HEAD_AWARE_RANDOM_SEED = EnvInt(0)
+    # Mamba checkpoint eviction policy: "lru" (recency-only, default),
+    # "value" (reuse-frequency), "gdsf" (value weighted by reconstruction
+    # cost). Reorders a degradable tier only -> trades hit-rate/TTFT, never
+    # correctness.
+    SGLANG_MAMBA_EVICT_POLICY = EnvStr("lru")
+
+    # State quantization for the head-aware checkpoint store. "none" = bf16
+    # passthrough (default), "int8" = per-group symmetric INT8 quantization.
+    # Group size = SGLANG_STATE_QUANT_GROUP_SIZE (default 128 = d_v).
+    SGLANG_STATE_QUANT_MODE = EnvStr("none")
+    SGLANG_STATE_QUANT_GROUP_SIZE = EnvInt(128)
+
+    # Checkpoint-load observability: log per-load slot/token stats.
+    SGLANG_LOG_CKPT_LOAD = EnvBool(False)
+    # Force the head-aware plan's W_max (overrides the default tau-based
+    # threshold). Used by w_max sweep experiments.
+    SGLANG_FORCE_HEAD_AWARE_WMAX = EnvInt(None)
+
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.

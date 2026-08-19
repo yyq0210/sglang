@@ -433,6 +433,9 @@ class Scheduler(
         self.enable_dp_attention = server_args.enable_dp_attention
         self.enable_unified_memory = server_args.enable_unified_memory
 
+        # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
+        self.gracefully_exit = False
+
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
             compute_dp_attention_world_info(
@@ -2365,6 +2368,8 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+            if radix_native_session:
+                req.session_id = session_id
 
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -3701,6 +3706,9 @@ class Scheduler(
                     req.extend_range.length if req.extend_range is not None else 0
                     for req in batch.reqs
                 ]
+                batch_result.extend_logprob_start_len_per_req = (
+                    batch.extend_logprob_start_lens
+                )
             else:
                 batch_result.extend_input_len_per_req = None
 

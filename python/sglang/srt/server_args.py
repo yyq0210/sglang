@@ -2528,6 +2528,24 @@ class ServerArgs:
         "Number of int8 mamba checkpoint slots (default: 2x the active mamba pool size).",
         NS("exec.mamba"),
     ] = None
+    enable_head_aware_mamba_checkpoint: A[
+        bool,
+        "Store radix-cached GDN (mamba) states head-aware: global heads (decay tau>window) keep the exact [K,V] state; local heads are dropped and rebuilt on a hit by re-prefilling last-W tokens through the full model. Smaller bytes/slot -> more cached-prefix capacity. Mutually exclusive with --enable-int8-mamba-checkpoint.",
+        NS("exec.mamba"),
+    ] = False
+    head_aware_route: A[
+        str,
+        Arg(
+            help="Head-aware local-head reconstruction route. Only 'A' is supported: stores only global-head state and re-prefills the last-W prefix tokens through the full model on a hit.",
+            choices=["A"],
+        ),
+        NS("exec.mamba"),
+    ] = "A"
+    head_aware_mamba_ckpt_size: A[
+        Optional[int],
+        "Number of head-aware mamba checkpoint slots (default: sized so the head-aware pool matches the int8 pool's HBM budget, i.e. capacity scales with the byte savings).",
+        NS("exec.mamba"),
+    ] = None
     linear_attn_backend: A[
         str,
         Arg(
@@ -3540,6 +3558,7 @@ class ServerArgs:
         self._disable_prefill_cuda_graph_for_deepseek_trtllm_mla()
         self._handle_mamba_backend()
         self._handle_int8_mamba_checkpoint()
+        self._handle_head_aware_mamba_checkpoint()
         self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
         self._handle_mxfp8_kv_cache_compatibility()
@@ -6022,6 +6041,45 @@ class ServerArgs:
                 "--enable-int8-mamba-checkpoint only supports the built-in mamba "
                 f"radix cache; --radix-cache-backend={self.radix_cache_backend!r} "
                 "is not int8-aware. Omit --radix-cache-backend."
+            )
+
+    def _handle_head_aware_mamba_checkpoint(self):
+        # Head-aware checkpoints share the exact same radix seam as the int8 pool
+        # (a sibling MambaCheckpointPool behind the same _commit/_free/COW hooks),
+        # so they carry the same restrictions AND cannot be enabled together (both
+        # would try to own the single mamba_ckpt_pool slot).
+        if not self.enable_head_aware_mamba_checkpoint:
+            return
+        if self.enable_int8_mamba_checkpoint:
+            raise ValueError(
+                "--enable-head-aware-mamba-checkpoint and "
+                "--enable-int8-mamba-checkpoint are mutually exclusive: both own "
+                "the single radix mamba checkpoint pool. Enable exactly one."
+            )
+        if self.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-head-aware-mamba-checkpoint is not supported together "
+                "with --enable-hierarchical-cache: the host-offload path "
+                "(HiMambaRadixCache) is not checkpoint-pool-aware. Disable one."
+            )
+        if self.radix_cache_backend is not None:
+            raise ValueError(
+                "--enable-head-aware-mamba-checkpoint only supports the built-in "
+                f"mamba radix cache; --radix-cache-backend={self.radix_cache_backend!r} "
+                "is not checkpoint-pool-aware. Omit --radix-cache-backend."
+            )
+        # Head-aware reconstruction only pays off when the radix actually caches
+        # shared-prefix states, which requires the extra_buffer mamba strategy (the
+        # default no_buffer snapshots state only at the full-sequence leaf, so a
+        # shared-prefix workload reuses ~0 state). "auto" resolves to extra_buffer
+        # later (when radix + model support it); only an explicit no_buffer is a
+        # sure misconfiguration to warn about here.
+        if self.mamba_radix_cache_strategy == "no_buffer":
+            logger.warning(
+                "--enable-head-aware-mamba-checkpoint benefits from "
+                "--mamba-radix-cache-strategy extra_buffer; with no_buffer the "
+                "radix caches ~0 shared-prefix state and the head-aware capacity "
+                "gain is unused."
             )
 
     def _handle_linear_attn_backend(self):

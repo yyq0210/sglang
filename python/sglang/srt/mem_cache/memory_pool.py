@@ -495,6 +495,12 @@ class MambaPool:
         self.replayssm_spec_fold = bool(enable_linear_replayssm_spec)
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
+        # Route-A head-aware checkpoint re-prefill: HeadAwareCheckpointPool.load_to_active
+        # sets this to a [L, HV] bool mask of local heads it left zeroed on a hit; the
+        # scheduler/tp_worker seam consumes it (reconstruct + copy_local_rows_from_scratch)
+        # then clears it back to None. Declared here so the attribute always exists.
+        self.mamba_head_reprefill_mask: Optional[torch.Tensor] = None
+
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
@@ -1227,15 +1233,26 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # of holding them in the active bf16 pool -> ~2x cached-prefix capacity at
         # fixed memory. Strategy-agnostic (no_buffer / extra_buffer / spec).
         from sglang.srt.mem_cache.mamba_checkpoint_pool import (
+            maybe_init_head_aware_mamba_checkpoint_pool,
             maybe_init_int8_mamba_checkpoint_pool,
         )
 
+        # int8 and head-aware are mutually exclusive (enforced in ServerArgs); both
+        # expose the same pool interface and are routed through the SAME radix seam
+        # via the single ``mamba_ckpt_pool`` attribute.
         self.mamba_ckpt_pool = maybe_init_int8_mamba_checkpoint_pool(
             mamba_size=mamba_size,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
             device=device,
         )
+        if self.mamba_ckpt_pool is None:
+            self.mamba_ckpt_pool = maybe_init_head_aware_mamba_checkpoint_pool(
+                mamba_size=mamba_size,
+                cache_params=cache_params,
+                mamba_layer_ids=mamba_layer_ids,
+                device=device,
+            )
 
         self.device = device
         req_pool_size = self.req_to_token.shape[0]
